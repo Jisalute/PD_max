@@ -1235,3 +1235,71 @@ async def get_train_visualization(filename: str):
     if not viz_file.exists():
         raise HTTPException(404, "可视化图片不存在")
     return FileResponse(str(viz_file), media_type="image/png")
+
+
+# ---- 运维与监控端点 ----
+
+@router.get(
+    "/api/v3/health",
+    summary="系统健康检查",
+    description="返回字体库、模型、OCR 等核心组件的就绪状态。",
+)
+async def health_check(engine: "InferenceEngineAPI" = Depends(get_engine)):
+    return {
+        "status": "ok",
+        "font_lib_ready": engine.font_lib.is_ready,
+        "font_lib_size": engine.font_lib.index.ntotal,
+        "global_model_loaded": engine.global_model is not None,
+        "ocr_available": engine.extractor.reader is not None,
+    }
+
+
+@router.get(
+    "/api/v3/models",
+    summary="列出所有模型版本",
+    description="返回模型版本注册表中的所有版本及当前活跃模型路径。",
+)
+async def list_models(engine: "InferenceEngineAPI" = Depends(get_engine)):
+    return engine.list_model_versions()
+
+
+@router.post(
+    "/api/v3/reload",
+    summary="热重载模型（无需重启服务）",
+    description="热重载 FAISS 字体库和 XGBoost 模型。可选指定 version 参数切换到历史版本。",
+)
+async def reload_models_endpoint(
+    version: Optional[str] = Form(None, description="指定版本时间戳，不传则加载当前活跃版本"),
+    engine: "InferenceEngineAPI" = Depends(get_engine),
+):
+    result = engine.reload_models(version=version)
+    return {"status": "success", "detail": result}
+
+
+@router.get(
+    "/api/v3/metrics",
+    summary="推理指标监控（Prometheus 格式）",
+    description="返回 Prometheus text/plain 格式的推理指标，包括请求数、延迟分布、字体库状态。",
+)
+async def get_metrics(engine: "InferenceEngineAPI" = Depends(get_engine)):
+    m = engine.get_metrics()
+    lines = [
+        "# HELP tamper_detection_predictions_total Total number of predictions.",
+        "# TYPE tamper_detection_predictions_total counter",
+        f"tamper_detection_predictions_total {m['total_predictions']}",
+        f"tamper_detection_tampered_total {m['tampered_count']}",
+        f"tamper_detection_suspicious_total {m['suspicious_count']}",
+        f"tamper_detection_normal_total {m['normal_count']}",
+        f"tamper_detection_errors_total {m['error_count']}",
+        "# HELP tamper_detection_inference_ms Inference latency in milliseconds.",
+        "# TYPE tamper_detection_inference_ms gauge",
+        f"tamper_detection_inference_p50_ms {m['inference_p50_ms']}",
+        f"tamper_detection_inference_p99_ms {m['inference_p99_ms']}",
+        f"tamper_detection_inference_avg_ms {m['avg_inference_ms']}",
+        "# HELP tamper_detection_font_lib_info Font library status.",
+        "# TYPE tamper_detection_font_lib_info gauge",
+        f"tamper_detection_font_lib_size {m['font_lib_size']}",
+        f"tamper_detection_font_lib_ready {1 if m['font_lib_ready'] else 0}",
+    ]
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
