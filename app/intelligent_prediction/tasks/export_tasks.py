@@ -164,6 +164,12 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 conn.close()
 
             if not target_warehouses:
+                batch.meta = {
+                    **(batch.meta or {}),
+                    "total_warehouses": 0,
+                    "completed_warehouses": 0,
+                    "progress_percent": 100,
+                }
                 batch.status = "completed"
                 batch.completed_at = datetime.now(timezone.utc)
                 await session.commit()
@@ -174,6 +180,15 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 "daily prediction: total target warehouses=%s, batch_id=%s",
                 len(target_warehouses), batch_id,
             )
+            total_warehouses = len(target_warehouses)
+            completed_warehouses = 0
+            batch.meta = {
+                **(batch.meta or {}),
+                "total_warehouses": total_warehouses,
+                "completed_warehouses": completed_warehouses,
+                "progress_percent": 0,
+            }
+            await session.commit()
 
             # 从 pd_ip_delivery_records 查询每个仓库的全部历史，按仓库级别预测
             wh_list = list(target_warehouses)
@@ -257,6 +272,23 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
             for req_item in items:
                 result, _hist = await resolve_one_predict_item(session, svc, req_item)
                 results.append(result)
+                # 逐仓库落库并提交进度，查询接口可以实时反映后台任务状态。
+                await svc.persist_sync_results(
+                    session,
+                    [result],
+                    batch_id=batch_id,
+                    history_map={req_item.warehouse: history_map.get(req_item.warehouse, [])},
+                )
+                completed_warehouses += 1
+                batch.meta = {
+                    **(batch.meta or {}),
+                    "total_warehouses": total_warehouses,
+                    "completed_warehouses": completed_warehouses,
+                    "progress_percent": round(
+                        completed_warehouses * 100 / total_warehouses, 2
+                    ),
+                }
+                await session.commit()
 
             # 覆盖机制：先删除同类型旧批次结果，再写入新结果，保证缓存数据每日覆盖
             old_batch_stmt = sa_select(PredictionBatch.id).where(
@@ -280,8 +312,6 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                     PredictionBatch.id.in_(old_batch_ids)
                 )
                 await session.execute(batch_del_stmt)
-
-            await svc.persist_sync_results(session, results, batch_id=batch_id, history_map=history_map)
 
             batch.status = "completed"
             batch.completed_at = datetime.now(timezone.utc)

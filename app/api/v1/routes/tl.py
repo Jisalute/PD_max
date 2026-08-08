@@ -72,6 +72,7 @@ TL比价模块路由
 """
 import asyncio
 import io
+import json
 import math
 import os
 import time
@@ -3111,6 +3112,86 @@ def trigger_daily_ai_prediction(
 
 
 @router.get(
+    "/daily_ai_prediction_status",
+    summary="查询最近一次批量AI预测状态",
+)
+def get_latest_daily_ai_prediction_status(
+    service: TLService = Depends(get_tl_service),
+):
+    """返回当前运行批次；没有运行任务时返回最近一次批次及其结束时间。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, status, error_message, meta, "
+                    "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
+                    "DATE_FORMAT(completed_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "FROM pd_ip_prediction_batches "
+                    "WHERE prediction_type = 'manual' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )
+                batch = cur.fetchone()
+                if not batch:
+                    return {
+                        "code": 200,
+                        "data": {
+                            "batch_id": None,
+                            "status": "never_run",
+                            "last_completed_at": None,
+                            "total_warehouses": 0,
+                            "completed_warehouses": 0,
+                            "progress_percent": 0,
+                        },
+                    }
+
+                meta = batch[3] or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except (TypeError, json.JSONDecodeError):
+                        meta = {}
+                meta = meta if isinstance(meta, dict) else {}
+                total = int(meta.get("total_warehouses") or 0)
+                completed = int(meta.get("completed_warehouses") or 0)
+                if not total:
+                    cur.execute(
+                        "SELECT COUNT(DISTINCT warehouse) "
+                        "FROM pd_ip_prediction_results WHERE batch_id = %s",
+                        (batch[0],),
+                    )
+                    completed = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    "SELECT DATE_FORMAT(MAX(completed_at), '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "FROM pd_ip_prediction_batches "
+                    "WHERE prediction_type = 'manual' AND status = 'completed'"
+                )
+                last_completed_at = cur.fetchone()[0]
+                progress = float(meta.get("progress_percent") or 0)
+                if batch[1] == "completed":
+                    progress = 100
+                elif total:
+                    progress = round(completed * 100 / total, 2)
+
+                return {
+                    "code": 200,
+                    "data": {
+                        "batch_id": batch[0],
+                        "status": batch[1],
+                        "error_message": batch[2],
+                        "created_at": batch[4],
+                        "completed_at": batch[5],
+                        "last_completed_at": last_completed_at,
+                        "total_warehouses": total,
+                        "completed_warehouses": completed,
+                        "progress_percent": progress,
+                    },
+                }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
     "/daily_ai_prediction_status/{batch_id}",
     summary="查询每日AI预测任务状态",
 )
@@ -3123,7 +3204,7 @@ def get_daily_ai_prediction_status(
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, status, error_message, "
+                    "SELECT id, status, error_message, meta, "
                     "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
                     "DATE_FORMAT(completed_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
                     "FROM pd_ip_prediction_batches WHERE id = %s",
@@ -3137,15 +3218,28 @@ def get_daily_ai_prediction_status(
                     (batch_id,),
                 )
                 result_count = int(cur.fetchone()[0] or 0)
+                meta = batch[3] or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except (TypeError, json.JSONDecodeError):
+                        meta = {}
+                meta = meta if isinstance(meta, dict) else {}
+                total_warehouses = int(meta.get("total_warehouses") or 0)
+                completed_warehouses = int(meta.get("completed_warehouses") or 0)
+                progress_percent = float(meta.get("progress_percent") or 0)
                 return {
                     "code": 200,
                     "data": {
                         "batch_id": batch[0],
                         "status": batch[1],
                         "error_message": batch[2],
-                        "created_at": batch[3],
-                        "completed_at": batch[4],
+                        "created_at": batch[4],
+                        "completed_at": batch[5],
                         "result_count": result_count,
+                        "total_warehouses": total_warehouses,
+                        "completed_warehouses": completed_warehouses,
+                        "progress_percent": progress_percent,
                     },
                 }
     except HTTPException:
