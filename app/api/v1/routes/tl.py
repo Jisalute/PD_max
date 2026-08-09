@@ -3124,8 +3124,8 @@ def get_latest_daily_ai_prediction_status(
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, status, error_message, meta, "
-                    "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
-                    "DATE_FORMAT(completed_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), "
+                    "DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s') "
                     "FROM pd_ip_prediction_batches "
                     "WHERE prediction_type = 'manual' "
                     "ORDER BY created_at DESC LIMIT 1"
@@ -3162,7 +3162,7 @@ def get_latest_daily_ai_prediction_status(
                     completed = int(cur.fetchone()[0] or 0)
 
                 cur.execute(
-                    "SELECT DATE_FORMAT(MAX(completed_at), '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "SELECT DATE_FORMAT(MAX(completed_at), '%Y-%m-%d %H:%i:%s') "
                     "FROM pd_ip_prediction_batches "
                     "WHERE prediction_type = 'manual' AND status = 'completed'"
                 )
@@ -3205,8 +3205,8 @@ def get_daily_ai_prediction_status(
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, status, error_message, meta, "
-                    "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
-                    "DATE_FORMAT(completed_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), "
+                    "DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s') "
                     "FROM pd_ip_prediction_batches WHERE id = %s",
                     (batch_id,),
                 )
@@ -3264,8 +3264,8 @@ def get_daily_ai_prediction_results(
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
-                    "DATE_FORMAT(completed_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "SELECT id, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), "
+                    "DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s') "
                     "FROM pd_ip_prediction_batches "
                     "WHERE prediction_type = 'manual' AND status = 'completed' "
                     "ORDER BY completed_at DESC LIMIT 1"
