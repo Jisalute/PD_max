@@ -11,9 +11,11 @@ import numpy as np
 from app.ai_detection.core.amount_candidates import (
     MASKED_ACCOUNT_PATTERN,
     OCRToken,
+    find_uppercase_amount_pairs,
     group_tokens_by_line,
     normalize_text,
 )
+from app.ai_detection.core.ai_watermark import detect_doubao_ai_watermark
 from app.ai_detection.core.detectors import OriginalityChecker
 from app.ai_detection.core.timestamp_checker import parse_exif_timestamps
 
@@ -41,6 +43,7 @@ ACCOUNT_FIELD_LABELS = (
 )
 
 DEFAULT_HARD_SEMANTIC_ANOMALIES = frozenset({
+    "doubao_ai_generated_watermark",
     "invalid_amount_format",
     "detail_field_typography_anomaly",
     "account_mask_pattern_inconsistent",
@@ -181,6 +184,17 @@ def is_large_amount_missing_separator(text: str, *, min_integer_digits: int = 5)
     integer_part = re.sub(r"^[+\-]?\s*(?:[¥￥])?", "", amount_text.split(".")[0])
     digits = re.sub(r"\D", "", integer_part)
     return len(digits) >= min_integer_digits
+
+
+def check_uppercase_lowercase_amount_consistency(tokens: Sequence[OCRToken]) -> Dict[str, Any]:
+    """只在大写与小写均可严格解析时报告金额不一致，OCR 失败不作篡改结论。"""
+    pairs = find_uppercase_amount_pairs(tokens)
+    mismatches = [pair for pair in pairs if pair.get("comparison_available") and pair.get("consistent") is False]
+    return {
+        "anomaly": bool(mismatches),
+        "pairs": pairs,
+        "mismatches": mismatches,
+    }
 
 
 def find_account_field_bbox(
@@ -340,6 +354,7 @@ def check_receipt_semantics(
     ocr_tokens: Optional[Sequence[OCRToken]] = None,
     image_shape: Optional[Tuple[int, int, int]] = None,
     thresholds: Optional[Dict[str, Any]] = None,
+    watermark_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """综合语义规则检测，供 rule-checks 调用。"""
     thresh = thresholds or {}
@@ -350,6 +365,13 @@ def check_receipt_semantics(
     reasons: List[str] = []
     risk = 0.0
     details: Dict[str, Any] = {}
+
+    ai_watermark = watermark_evidence or detect_doubao_ai_watermark(tokens)
+    details["ai_watermark"] = ai_watermark
+    if ai_watermark:
+        anomalies.append("doubao_ai_generated_watermark")
+        reasons.append(str(ai_watermark["reason"]))
+        risk = 1.0
 
     invalid_amounts: List[str] = []
     for token in tokens:
@@ -367,6 +389,13 @@ def check_receipt_semantics(
         reasons.append(f"金额千分位格式异常（如 {sample}）")
         risk = max(risk, float(thresh.get("semantic_amount_format_risk", 0.78)))
 
+    amount_consistency = check_uppercase_lowercase_amount_consistency(tokens)
+    details["uppercase_lowercase_amounts"] = amount_consistency
+    if amount_consistency.get("anomaly"):
+        anomalies.append("uppercase_lowercase_amount_mismatch")
+        reasons.append("金额大写与小写不一致")
+        risk = max(risk, float(thresh.get("semantic_amount_consistency_risk", 0.45)))
+
     mask_check = check_account_mask_consistency(tokens)
     details["account_masks"] = mask_check
     if mask_check.get("anomaly"):
@@ -382,10 +411,12 @@ def check_receipt_semantics(
         reasons.append(f"明细行排版不一致（{outlier_text}）")
         risk = max(risk, float(thresh.get("semantic_typography_risk", 0.72)))
 
+    # 金额大小写不一致本身只是语义证据，不能单独升级为合成图硬判。
+    synthetic_evidence = [item for item in anomalies if item != "uppercase_lowercase_amount_mismatch"]
     synthetic = check_synthetic_image_signals(
         image_path,
         ocr_tokens=tokens,
-        semantic_anomalies=anomalies,
+        semantic_anomalies=synthetic_evidence,
         thresholds=thresh,
     )
     details["synthetic"] = synthetic

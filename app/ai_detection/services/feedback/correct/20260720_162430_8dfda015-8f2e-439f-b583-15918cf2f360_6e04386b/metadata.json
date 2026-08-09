@@ -1,0 +1,51 @@
+{
+  "task_id": "8dfda015-8f2e-439f-b583-15918cf2f360",
+  "judgment": "correct",
+  "timestamp": "20260720_162430",
+  "bbox": [
+    1131,
+    1413,
+    1280,
+    1460
+  ],
+  "engine_result": {
+    "bbox": [
+      1131,
+      1413,
+      149,
+      47
+    ],
+    "reason": "存在局部边缘拼接/像素涂抹痕迹",
+    "result": "正常",
+    "region_no": 1,
+    "confidence": 0.46568766850928633,
+    "field_type": "amount",
+    "field_label": "金额",
+    "original_bbox": [
+      1131,
+      1413,
+      1280,
+      1460
+    ],
+    "hard_tamper_flags": {
+      "bbox_iou": false
+    },
+    "bbox_overlap_check": {
+      "max_iou": 0.0,
+      "anomalies": [],
+      "box_count": 6,
+      "risk_max_iou": 0.0,
+      "overlapping_pairs": []
+    }
+  },
+  "user_note": "result_index:0",
+  "entry_id": "6e04386b",
+  "original_image": "/home/ubuntu/var/www/PD_max/app/ai_detection/services/feedback/correct/20260720_162430_8dfda015-8f2e-439f-b583-15918cf2f360_6e04386b/original.jpg",
+  "cropped_roi": null,
+  "original_filename": "12.jpg",
+  "content_sha256": "4ffd6b48e0662f6f4577b903cab1196ba134509881fccbff5df61f297a7cdc04",
+  "size_bytes": 170607,
+  "media_type": "image/jpeg",
+  "initial_reviewer": "anonymous",
+  "review_status": "pending"
+}

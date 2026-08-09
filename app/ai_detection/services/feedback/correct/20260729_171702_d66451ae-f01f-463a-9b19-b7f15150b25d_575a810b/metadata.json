@@ -1,0 +1,51 @@
+{
+  "task_id": "d66451ae-f01f-463a-9b19-b7f15150b25d",
+  "judgment": "correct",
+  "timestamp": "20260729_171702",
+  "bbox": [
+    816,
+    727,
+    943,
+    776
+  ],
+  "engine_result": {
+    "bbox": [
+      816,
+      727,
+      127,
+      49
+    ],
+    "reason": "存在局部边缘拼接/像素涂抹痕迹",
+    "result": "正常",
+    "region_no": 1,
+    "confidence": 0.45813168238796664,
+    "field_type": "name",
+    "field_label": "姓名",
+    "original_bbox": [
+      816,
+      727,
+      943,
+      776
+    ],
+    "hard_tamper_flags": {
+      "bbox_iou": false
+    },
+    "bbox_overlap_check": {
+      "max_iou": 0.0,
+      "anomalies": [],
+      "box_count": 5,
+      "risk_max_iou": 0.0,
+      "overlapping_pairs": []
+    }
+  },
+  "user_note": "result_index:0",
+  "entry_id": "575a810b",
+  "original_image": "/home/ubuntu/var/www/PD_max/app/ai_detection/services/feedback/correct/20260729_171702_d66451ae-f01f-463a-9b19-b7f15150b25d_575a810b/original.jpg",
+  "cropped_roi": null,
+  "original_filename": "付彩云_2076460087041736704_1.jpg",
+  "content_sha256": "925862bc7de93e78304749e5b46772d25d921afc63bcd850c9ab0f3294705699",
+  "size_bytes": 166710,
+  "media_type": "image/jpeg",
+  "initial_reviewer": "anonymous",
+  "review_status": "pending"
+}

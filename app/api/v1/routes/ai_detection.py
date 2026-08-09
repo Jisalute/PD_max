@@ -32,6 +32,10 @@ from app.ai_detection.core.amount_candidates import (
     build_amount_candidates,
     detect_certificate_document_override,
 )
+from app.ai_detection.core.ai_watermark import (
+    detect_doubao_ai_watermark,
+    detect_doubao_ai_watermark_template,
+)
 from app.ai_detection.runtime.resource_limits import configure_loaded_cv2, trim_native_memory
 from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_DIR
 from app.ai_detection.runtime.easyocr_download_patch import patch_easyocr_download
@@ -58,6 +62,7 @@ from app.ai_detection.services.history_db import (
     purge_ai_detection_history_older_than,
 )
 from app.ai_detection.core.ocr_utils import build_key_field_rois_from_tokens, run_full_image_ocr
+from app.ai_detection.core.utils import safe_read_image
 from app.ai_detection.services.rule_check_display import build_rule_check_public_summary
 from app.ai_detection.services.rule_check_history import (
     MODE_RULE_CHECKS,
@@ -70,6 +75,7 @@ from app.ai_detection.services.rule_check_history import (
     persist_rule_check_history,
 )
 from app.ai_detection.services.rule_check_service import (
+    build_ai_watermark_hard_tamper_result,
     merge_pixel_overlap_results,
     run_pixel_overlap_check,
     run_rule_checks,
@@ -1256,38 +1262,46 @@ class RuleCheckService:
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
-            if FORGEGUARD_REPLACE_RULE_CHECKS:
+            tmp_path = await RuleCheckService._save_upload_to_temp(file)
+            image_bgr = await run_in_threadpool(safe_read_image, tmp_path)
+            watermark_evidence = await run_in_threadpool(detect_doubao_ai_watermark_template, image_bgr)
+            if watermark_evidence:
+                # 已知水印是业务硬证据，先命中可避免大图 OCR 阻塞规则-only 请求。
+                data = build_ai_watermark_hard_tamper_result(watermark_evidence)
+            elif FORGEGUARD_REPLACE_RULE_CHECKS:
+                # _save_upload_to_temp 已读取请求流；回退 ForgeGuard 前必须复位，避免发送空文件。
+                await file.seek(0)
                 return await RuleCheckService._process_via_forgeguard(
                     file, bbox_list=bbox_list, bboxes_list=bboxes_list,
                     business_datetime=business_datetime, task_id=task_id,
                     image_created_at=image_created_at,
                     batch=batch,
                 )
-            tmp_path = await RuleCheckService._save_upload_to_temp(file)
-            async with semaphore:
-                img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
-                image_shape = None
-                if img_cv2 is not None:
-                    image_shape = (
-                        int(img_cv2.shape[0]),
-                        int(img_cv2.shape[1]),
-                        int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
+            else:
+                async with semaphore:
+                    img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
+                    image_shape = None
+                    if img_cv2 is not None:
+                        image_shape = (
+                            int(img_cv2.shape[0]),
+                            int(img_cv2.shape[1]),
+                            int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
+                        )
+                    data = await run_in_threadpool(
+                        partial(
+                            run_rule_checks,
+                            tmp_path,
+                            engine.pixel_detector,
+                            bbox_xyxy=bbox_list,
+                            bboxes=bboxes_list,
+                            business_datetime=business_datetime,
+                            ocr_tokens=ocr_tokens or None,
+                            image_shape=image_shape,
+                            thresholds=engine.config.get("thresholds", {}),
+                            business_rules=engine.config.get("business_rules", {}),
+                            image_bgr=img_cv2,
+                        ),
                     )
-                data = await run_in_threadpool(
-                    partial(
-                        run_rule_checks,
-                        tmp_path,
-                        engine.pixel_detector,
-                        bbox_xyxy=bbox_list,
-                        bboxes=bboxes_list,
-                        business_datetime=business_datetime,
-                        ocr_tokens=ocr_tokens or None,
-                        image_shape=image_shape,
-                        thresholds=engine.config.get("thresholds", {}),
-                        business_rules=engine.config.get("business_rules", {}),
-                        image_bgr=img_cv2,
-                    ),
-                )
             await RuleCheckService._persist_rule_check_history(
                 mode=MODE_RULE_CHECKS,
                 original_filename=file.filename,
@@ -1348,33 +1362,40 @@ class RuleCheckService:
         precomputed_image_shape: Optional[Tuple[int, int, int]] = None,
     ) -> Dict[str, Any]:
         """对已落盘图片执行规则检测（供 v3 任务链式调用）。"""
-        async with semaphore:
-            img_cv2 = precomputed_image_bgr
-            ocr_tokens = list(precomputed_ocr_tokens or [])
-            image_shape = precomputed_image_shape
-            if img_cv2 is None or not ocr_tokens or image_shape is None:
-                img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, image_path, ocr_reader)
-                if img_cv2 is not None:
-                    image_shape = (
-                        int(img_cv2.shape[0]),
-                        int(img_cv2.shape[1]),
-                        int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
-                    )
-            data = await run_in_threadpool(
-                partial(
-                    run_rule_checks,
-                    image_path,
-                    engine.pixel_detector,
-                    bbox_xyxy=bbox_list,
-                    bboxes=bboxes_list,
-                    business_datetime=business_datetime,
-                    ocr_tokens=ocr_tokens or None,
-                    image_shape=image_shape,
-                    thresholds=engine.config.get("thresholds", {}),
-                    business_rules=engine.config.get("business_rules", {}),
-                    image_bgr=img_cv2,
-                ),
-            )
+        img_cv2 = precomputed_image_bgr
+        if img_cv2 is None:
+            img_cv2 = await run_in_threadpool(safe_read_image, image_path)
+        watermark_evidence = await run_in_threadpool(detect_doubao_ai_watermark_template, img_cv2)
+        if watermark_evidence:
+            data = build_ai_watermark_hard_tamper_result(watermark_evidence)
+        else:
+            async with semaphore:
+                img_cv2 = precomputed_image_bgr
+                ocr_tokens = list(precomputed_ocr_tokens or [])
+                image_shape = precomputed_image_shape
+                if img_cv2 is None or not ocr_tokens or image_shape is None:
+                    img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, image_path, ocr_reader)
+                    if img_cv2 is not None:
+                        image_shape = (
+                            int(img_cv2.shape[0]),
+                            int(img_cv2.shape[1]),
+                            int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
+                        )
+                data = await run_in_threadpool(
+                    partial(
+                        run_rule_checks,
+                        image_path,
+                        engine.pixel_detector,
+                        bbox_xyxy=bbox_list,
+                        bboxes=bboxes_list,
+                        business_datetime=business_datetime,
+                        ocr_tokens=ocr_tokens or None,
+                        image_shape=image_shape,
+                        thresholds=engine.config.get("thresholds", {}),
+                        business_rules=engine.config.get("business_rules", {}),
+                        image_bgr=img_cv2,
+                    ),
+                )
         await RuleCheckService._persist_rule_check_history(
             mode=MODE_RULE_CHECKS,
             original_filename=original_filename,
@@ -1754,6 +1775,32 @@ class DetectionDomainServiceV3:
             "amount_score": override.get("amount_score"),
         }
 
+    def _doubao_watermark_override(self) -> Optional[Dict[str, Any]]:
+        """水印是明确平台标识，命中后不依赖金额、姓名、时间 ROI。"""
+        evidence = detect_doubao_ai_watermark(self._cached_tokens or [])
+        if evidence is None:
+            evidence = detect_doubao_ai_watermark_template(self._cached_img_cv2)
+        if not evidence:
+            return None
+        bbox_xyxy = [int(value) for value in evidence["bbox_xyxy"]]
+        return {
+            "result": "篡改",
+            "confidence": 1.0,
+            "reason": evidence["reason"],
+            "bbox": self._xyxy_to_xywh(bbox_xyxy),
+            "original_bbox": bbox_xyxy,
+            "region_no": 1,
+            "field_type": "other",
+            "field_label": "AI水印",
+            "source": evidence["source"],
+            "text": evidence["matched_text"],
+            "ocr_confidence": evidence.get("ocr_confidence"),
+            "evidence_type": evidence["evidence_type"],
+            "watermark_score": evidence.get("watermark_score"),
+            "detection_method": evidence.get("detection_method", "ocr_exact"),
+            "hard_tamper_flags": {"doubao_ai_watermark": True},
+        }
+
     def _visual_document_override(self) -> Optional[Dict[str, Any]]:
         """Do not infer tampering from document layout when key OCR fields are absent."""
         return None
@@ -1910,7 +1957,22 @@ class DetectionDomainServiceV3:
                     task_id,
                     (time.perf_counter() - ocr_started_at) * 1000.0,
                 )
+            watermark_override = self._doubao_watermark_override()
             predict_extra = self._predict_kwargs()
+
+            if watermark_override:
+                await self._finalize_completed_task(
+                    task_id,
+                    image_path,
+                    original_filename=history_filename,
+                    bbox=bbox,
+                    result=watermark_override,
+                    multi_results=[watermark_override],
+                    persist_bbox=(bbox.model_dump() if bbox else {"auto_ocr": True, "note": "doubao_ai_watermark"}),
+                    image_created_at=image_created_at,
+                    batch=batch,
+                )
+                return
 
             if bbox:
                 bbox_list = [bbox.x1, bbox.y1, bbox.x2, bbox.y2]
@@ -2261,7 +2323,14 @@ async def rule_checks_endpoint(
             image_created_at=image_created_at,
             batch=batch,
         )
-        return {"status": "success", "data": data}
+        summary = build_rule_check_public_summary(data)
+        # 顶层 status 保持 HTTP 协议兼容，业务结论单独返回，避免规则-only 调用方误把 success 当成正常。
+        return {
+            "status": "success",
+            "detection_result": summary["status"],
+            "data": data,
+            "summary": summary,
+        }
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
 
@@ -2333,7 +2402,15 @@ async def rule_checks_from_task_endpoint(
                 image_created_at=image_created_at or task.image_created_at,
                 batch=batch or task.batch,
             )
-        return {"status": "success", "data": data, "task_id": task.task_id, "batch": batch or task.batch}
+        summary = build_rule_check_public_summary(data)
+        return {
+            "status": "success",
+            "detection_result": summary["status"],
+            "data": data,
+            "summary": summary,
+            "task_id": task.task_id,
+            "batch": batch or task.batch,
+        }
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
 
@@ -3120,15 +3197,19 @@ class ReviewRegionRequest(BaseModel):
     y1: float = Field(..., ge=0.0, le=1.0)
     x2: float = Field(..., ge=0.0, le=1.0)
     y2: float = Field(..., ge=0.0, le=1.0)
+    is_tampered: Optional[bool] = None
+    source: Optional[str] = Field(None, max_length=128)
 
 
 class FeedbackReviewRequest(BaseModel):
+    schema_version: Literal[1, 2] = 1
     label: int = Field(..., ge=0, le=1, description="真实标签：0=正常，1=篡改")
     note: str = ""
     regions: List[ReviewRegionRequest] = Field(default_factory=list)
 
 
 class ReviewedDatasetUpdateRequest(BaseModel):
+    schema_version: Literal[1, 2] = 1
     original_filename: Optional[str] = Field(None, max_length=512)
     label: Optional[int] = Field(None, ge=0, le=1)
     note: str = ""
@@ -3414,6 +3495,7 @@ async def review_feedback(
                 reviewer=_actor_name(admin),
                 note=req.note,
                 regions=[region.model_dump() for region in req.regions],
+                schema_version=req.schema_version,
             )
         )
     except (ReviewedDatasetConflict, ReviewRegionRequired, ValueError) as exc:
@@ -3565,6 +3647,7 @@ async def update_reviewed_dataset(
                 regions=[region.model_dump() for region in req.regions] if req.regions is not None else None,
                 reviewer=_actor_name(admin),
                 note=req.note,
+                schema_version=req.schema_version,
             )
         )
     except ReviewedDatasetNotFound as exc:
@@ -3822,10 +3905,11 @@ async def _evaluate_candidate_model(
     config = _read_model_config()
     dataset_cfg = config.get("dataset") if isinstance(config.get("dataset"), dict) else {}
     image_dir = _resolve_model_path(dataset_cfg.get("image_dir", "images"))
+    fixed_samples = list(fixed_regression_samples(image_dir))
+    replay_samples = list(training_replay_samples(image_dir))
+    frozen_test_samples = [(path, label, "test") for path, label in holdout_samples(image_dir)]
     predictions = []
     replay_predictions = []
-    holdout_predictions = []
-    coverage = {"sample_count": 0, "recognized_count": 0}
     old_model = engine.global_model
     old_font_lib = engine.font_lib
     old_threshold = getattr(engine, "_global_fake_threshold", None)
@@ -3839,6 +3923,34 @@ async def _evaluate_candidate_model(
         loaded_font_lib = FontFeatureLibrary()
         if loaded_font_lib.load(candidate_font_path):
             candidate_font_lib = loaded_font_lib
+    from app.ai_detection.workflows.v3_evaluation import (
+        ProductionV3Evaluator,
+        evaluate_v3_sample,
+        summarize_v3_rows,
+        write_v3_result_package,
+    )
+
+    async def evaluate_rows(
+        evaluator: ProductionV3Evaluator,
+        samples: Sequence[Tuple[Path, int, str]],
+        cohort: str,
+    ) -> list[Dict[str, Any]]:
+        rows = []
+        for image_path, expected_label, split in samples:
+            row = await run_in_threadpool(
+                evaluate_v3_sample,
+                evaluator,
+                image_path,
+                expected_label,
+                split,
+                cohort,
+                image_root=image_dir,
+            )
+            rows.append(row)
+        return rows
+
+    active_evaluator = ProductionV3Evaluator(engine, ocr_reader)
+    active_test_rows = await evaluate_rows(active_evaluator, frozen_test_samples, "independent")
     try:
         engine.global_model = candidate_model
         engine._global_fake_threshold = float(candidate.get("global_fake_threshold", old_threshold or 0.65))
@@ -3847,25 +3959,26 @@ async def _evaluate_candidate_model(
         if candidate_font_lib is not None:
             engine.font_lib = candidate_font_lib
 
-        from app.ai_detection.workflows.v3_evaluation import ProductionV3Evaluator
-
         evaluator = ProductionV3Evaluator(engine, ocr_reader)
-
-        async def evaluate_one(image_path: Path) -> tuple[str, bool]:
-            result = await run_in_threadpool(evaluator.evaluate_image, image_path)
-            return str(result.get("result") or "无法自动检测"), bool(result.get("roi_count"))
-
-        for image_path, expected_label in fixed_regression_samples(image_dir):
-            actual, _recognized = await evaluate_one(image_path)
-            predictions.append((str(image_path), expected_label, actual))
-        for image_path, expected_label in training_replay_samples(image_dir):
-            actual, _recognized = await evaluate_one(image_path)
-            replay_predictions.append((str(image_path), expected_label, actual))
-        for image_path, expected_label in holdout_samples(image_dir):
-            actual, recognized = await evaluate_one(image_path)
-            holdout_predictions.append((str(image_path), expected_label, actual))
-            coverage["sample_count"] += 1
-            coverage["recognized_count"] += int(recognized)
+        fixed_rows = await evaluate_rows(
+            evaluator,
+            [(path, label, "fixed_regression") for path, label in fixed_samples],
+            "fixed_regression",
+        )
+        replay_rows = await evaluate_rows(
+            evaluator,
+            [(path, label, "train") for path, label in replay_samples],
+            "training_replay",
+        )
+        candidate_test_rows = await evaluate_rows(evaluator, frozen_test_samples, "independent")
+        predictions = [
+            (str(row["image_path"]), int(row["expected_label"]), str(row["result"]))
+            for row in fixed_rows
+        ]
+        replay_predictions = [
+            (str(row["image_path"]), int(row["expected_label"]), str(row["result"]))
+            for row in replay_rows
+        ]
     finally:
         engine.global_model = old_model
         engine.font_lib = old_font_lib
@@ -3874,15 +3987,15 @@ async def _evaluate_candidate_model(
         engine._has_calibrated_global_threshold = old_threshold_calibrated
         engine._known_source_matcher = old_known_source_matcher
 
-    holdout_metrics = _v3_holdout_metrics(holdout_predictions)
-    coverage["coverage"] = coverage["recognized_count"] / max(1, coverage["sample_count"])
+    candidate_test_metrics = summarize_v3_rows(candidate_test_rows)
+    active_test_metrics = summarize_v3_rows(active_test_rows)
     gates = build_candidate_gates(
         regression_predictions=predictions,
         candidate_metrics=candidate.get("evaluation"),
         active_metrics=active_metrics,
         training_replay_predictions=replay_predictions,
-        holdout_metrics=holdout_metrics,
-        roi_coverage=coverage,
+        candidate_test_metrics=candidate_test_metrics,
+        active_test_metrics=active_test_metrics,
     )
     report = {
         "version": version,
@@ -3895,17 +4008,23 @@ async def _evaluate_candidate_model(
             {"path": path, "expected_label": label, "actual": actual}
             for path, label, actual in replay_predictions
         ],
-        "holdout_predictions": [
-            {"path": path, "expected_label": label, "actual": actual}
-            for path, label, actual in holdout_predictions
-        ],
-        "holdout_metrics": holdout_metrics,
-        "roi_coverage": coverage,
+        "active_test_metrics": active_test_metrics,
+        "candidate_test_metrics": candidate_test_metrics,
+        "active_test_results": active_test_rows,
+        "candidate_test_results": candidate_test_rows,
     }
     report_path = candidate.get("report_path")
     version_dir = Path(str(candidate.get("model_path") or "")).parent
     reports_dir = version_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
+    package = write_v3_result_package(
+        reports_dir / "candidate_e2e",
+        [*fixed_rows, *replay_rows, *candidate_test_rows],
+        model_version=version,
+        run_id=f"candidate-{version}",
+        engine=engine,
+    )
+    report["result_package"] = package
     production_report_path = reports_dir / "production_evaluation.json"
     production_report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     production_report_markdown = [
@@ -3913,8 +4032,10 @@ async def _evaluate_candidate_model(
         "",
         f"- Version: `{version}`",
         f"- Gate passed: `{gates.get('passed', False)}`",
-        f"- Holdout ROI coverage: `{coverage['coverage']:.1%}`",
-        f"- Holdout balanced accuracy: `{holdout_metrics.get('balanced_accuracy')}`",
+        f"- Candidate test ROI coverage: `{candidate_test_metrics.get('roi_coverage', 0.0):.1%}`",
+        f"- Active test ROI coverage: `{active_test_metrics.get('roi_coverage', 0.0):.1%}`",
+        f"- Candidate test balanced accuracy: `{candidate_test_metrics.get('balanced_accuracy')}`",
+        f"- Active test balanced accuracy: `{active_test_metrics.get('balanced_accuracy')}`",
         f"- Replay failures: `{len(gates.get('training_replay_regression', {}).get('failures', []))}`",
     ]
     (reports_dir / "production_evaluation.md").write_text(

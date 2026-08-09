@@ -14,11 +14,13 @@ import cv2
 import numpy as np
 
 from app.ai_detection.core.amount_candidates import build_amount_candidates, detect_certificate_document_override
+from app.ai_detection.core.dataset_policy import is_v3_baseline_sample
 from app.ai_detection.core.ocr_utils import build_key_field_rois_from_tokens, run_full_image_ocr
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 RESULT_ORDER = {"篡改": 3, "可疑": 2, "正常": 1, "无法自动检测": 0, "错误": -1}
+SPLIT_NAMES = ("train", "validation", "test")
 
 
 def _now_run_id() -> str:
@@ -71,6 +73,8 @@ class ProductionV3Evaluator:
             return self._empty(path, "错误", "无法读取图片或路径不存在", started_at)
 
         key_rois = _dedupe_rois(build_key_field_rois_from_tokens(tokens, image.shape))
+        for roi in key_rois:
+            roi.setdefault("source", "ocr_key_roi")
         if not key_rois:
             return self._empty(path, "无法自动检测", "未识别到金额、姓名、时间关键区域，无法自动检测", started_at, tokens=tokens)
 
@@ -122,6 +126,7 @@ class ProductionV3Evaluator:
             "confidence": float((top or {}).get("confidence") or 0.0),
             "reason": str((top or {}).get("reason") or "未产生可用区域结果"),
             "regions": regions,
+            "auto_rois": key_rois,
             "roi_count": len(key_rois),
             "ocr_token_count": len(tokens),
             "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 1),
@@ -135,6 +140,7 @@ class ProductionV3Evaluator:
             "confidence": 0.0,
             "reason": reason,
             "regions": [],
+            "auto_rois": [],
             "roi_count": 0,
             "ocr_token_count": len(tokens),
             "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 1),
@@ -148,7 +154,7 @@ def load_manifest_samples(image_root: str | Path) -> tuple[list[tuple[Path, int,
     independent: list[tuple[Path, int, str]] = []
     replay: list[tuple[Path, int, str]] = []
     for row in manifest.get("entries", []):
-        if row.get("is_derived"):
+        if not is_v3_baseline_sample(row):
             continue
         path = (root / str(row.get("path") or "")).resolve()
         if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES or path in seen:
@@ -174,9 +180,9 @@ def run_v3_retest(
     output_dir = Path(output_root) / run_id
     output_dir.mkdir(parents=True, exist_ok=False)
     independent, replay = load_manifest_samples(image_root)
-    rows = [_evaluate_sample(evaluator, path, label, split, "independent") for path, label, split in independent]
-    rows.extend(_evaluate_sample(evaluator, path, label, split, "training_replay") for path, label, split in replay)
-    report = _write_result_package(
+    rows = evaluate_v3_samples(evaluator, independent, "independent", image_root=image_root)
+    rows.extend(evaluate_v3_samples(evaluator, replay, "training_replay", image_root=image_root))
+    report = write_v3_result_package(
         output_dir,
         rows,
         model_version=model_version,
@@ -186,9 +192,74 @@ def run_v3_retest(
     return {"output_dir": str(output_dir), **report}
 
 
-def _evaluate_sample(evaluator: ProductionV3Evaluator, path: Path, label: int, split: str, cohort: str) -> dict[str, Any]:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_local_manual_rois(image_path: str | Path, image_root: str | Path) -> list[dict[str, Any]]:
+    """本机标注仅作离线评估叠加，SHA 不一致时绝不复用坐标。"""
+    path = Path(image_path).resolve()
+    root = Path(image_root).resolve()
+    sidecar_path = root.parent / "locate_json" / "annotations" / "local" / f"{_file_sha256(path)}.json"
+    if not sidecar_path.is_file():
+        return []
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or payload.get("image_sha256") != _file_sha256(path):
+        return []
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        return []
+    if str(payload.get("image_relative_path") or "") != relative:
+        return []
+    items = payload.get("manual_rois")
+    if not isinstance(items, list):
+        return []
+    regions = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        field_type = str(item.get("field_type") or "").lower()
+        if field_type not in {"amount", "name", "time", "other"}:
+            continue
+        try:
+            x1, y1, x2, y2 = (float(item[key]) for key in ("x1", "y1", "x2", "y2"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0:
+            regions.append(
+                {
+                    "field_type": field_type,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "is_tampered": item.get("is_tampered"),
+                    "source": str(item.get("source") or "local_manual"),
+                }
+            )
+    return regions
+
+
+def evaluate_v3_sample(
+    evaluator: ProductionV3Evaluator,
+    path: Path,
+    label: int,
+    split: str,
+    cohort: str,
+    *,
+    image_root: str | Path | None = None,
+) -> dict[str, Any]:
     evaluation = evaluator.evaluate_image(path)
     expected = "正常" if label == 0 else "篡改"
+    manual_rois = load_local_manual_rois(path, image_root) if image_root is not None else []
     return {
         "filename": path.name,
         "image_path": str(path),
@@ -197,8 +268,26 @@ def _evaluate_sample(evaluator: ProductionV3Evaluator, path: Path, label: int, s
         "split": split,
         "cohort": cohort,
         "strict_correct": evaluation["result"] == expected,
+        "manual_rois": manual_rois,
         **evaluation,
     }
+
+
+def evaluate_v3_samples(
+    evaluator: ProductionV3Evaluator,
+    samples: Iterable[tuple[Path, int, str]],
+    cohort: str,
+    *,
+    image_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        evaluate_v3_sample(evaluator, path, label, split, cohort, image_root=image_root)
+        for path, label, split in samples
+    ]
+
+
+def summarize_v3_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    return _metrics(rows)
 
 
 def _metrics(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -208,11 +297,21 @@ def _metrics(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     tampered = [item for item in items if item["expected_label"] == 1]
     recognized = sum(item["roi_count"] > 0 for item in items)
     return {
+        "available": bool(items and normal and tampered),
         "sample_count": len(items),
+        "normal_sample_count": len(normal),
+        "tampered_sample_count": len(tampered),
         "strict_correct": sum(bool(item["strict_correct"]) for item in items),
         "strict_accuracy": round(sum(bool(item["strict_correct"]) for item in items) / max(1, len(items)), 6),
         "normal_recall": round(sum(item["result"] == "正常" for item in normal) / max(1, len(normal)), 6),
         "tampered_recall": round(sum(item["result"] == "篡改" for item in tampered) / max(1, len(tampered)), 6),
+        "balanced_accuracy": round(
+            (
+                sum(item["result"] == "正常" for item in normal) / max(1, len(normal))
+                + sum(item["result"] == "篡改" for item in tampered) / max(1, len(tampered))
+            ) / 2.0,
+            6,
+        ) if normal and tampered else None,
         "result_counts": dict(counts),
         "suspicious_count": counts["可疑"],
         "unable_count": counts["无法自动检测"],
@@ -226,7 +325,7 @@ def _metrics(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _write_result_package(
+def write_v3_result_package(
     output_dir: Path,
     rows: list[dict[str, Any]],
     *,
@@ -234,9 +333,17 @@ def _write_result_package(
     run_id: str,
     engine: Any = None,
 ) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
     independent = [row for row in rows if row["cohort"] == "independent"]
     replay = [row for row in rows if row["cohort"] == "training_replay"]
     metrics = {"independent": _metrics(independent), "training_replay": _metrics(replay)}
+    split_metrics = {
+        split: _metrics([row for row in independent if row.get("split") == split])
+        for split in SPLIT_NAMES
+    }
+    metrics["splits"] = split_metrics
+    metrics.update(split_metrics)
+    metrics["independent_note"] = "兼容旧调用的非回放汇总，混合 train/validation/test，不作为独立测试指标。"
     thresholds = _decision_thresholds(engine)
     metrics["decision_thresholds"] = thresholds
     metrics["training_replay_details"] = [_replay_detail(row, thresholds) for row in replay]
@@ -266,10 +373,10 @@ def _write_result_package(
     annotated = output_dir / "annotated"
     annotated.mkdir(exist_ok=True)
     failures = [row for row in rows if not row["strict_correct"]]
-    samples = failures + [row for cohort in ("independent", "training_replay") for row in rows if row["cohort"] == cohort][:5]
-    selected: dict[str, dict[str, Any]] = {row["image_path"]: row for row in samples}
+    selected: dict[str, dict[str, Any]] = {row["image_path"]: row for row in rows}
     for row in selected.values():
-        _draw_annotation(row, annotated / f"{Path(row['filename']).stem}__{row['cohort']}.jpg")
+        suffix = hashlib.sha256(row["image_path"].encode("utf-8")).hexdigest()[:10]
+        _draw_annotation(row, annotated / f"{Path(row['filename']).stem}__{row['cohort']}__{suffix}.jpg")
 
     _write_charts(output_dir, rows, metrics)
     report = _markdown_report(metrics, failures)
@@ -289,6 +396,23 @@ def _draw_annotation(row: dict[str, Any], target: Path) -> None:
         return
     colors = {"篡改": (40, 40, 220), "可疑": (0, 170, 230), "正常": (40, 160, 50)}
     color = colors.get(str(row["result"]), (100, 100, 100))
+    for roi in row.get("auto_rois") or []:
+        bbox = roi.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        x1, y1, x2, y2 = [int(value) for value in bbox]
+        _draw_dashed_rectangle(image, (x1, y1), (x2, y2), (180, 90, 30))
+        source = str(roi.get("source") or "ocr_key_roi")
+        cv2.putText(
+            image,
+            f"auto {roi.get('field_type') or 'roi'} {source}",
+            (x1, min(image.shape[0] - 6, y2 + 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.43,
+            (180, 90, 30),
+            1,
+            cv2.LINE_AA,
+        )
     for region in row.get("regions") or []:
         bbox = region.get("original_bbox") or []
         if len(bbox) != 4:
@@ -297,8 +421,41 @@ def _draw_annotation(row: dict[str, Any], target: Path) -> None:
         cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
         label = f"#{region.get('region_no')} {region.get('field_type')} {float(region.get('confidence') or 0):.2f}"
         cv2.putText(image, label, (x1, max(18, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    for region in row.get("manual_rois") or []:
+        try:
+            x1 = int(float(region["x1"]) * image.shape[1])
+            y1 = int(float(region["y1"]) * image.shape[0])
+            x2 = int(float(region["x2"]) * image.shape[1])
+            y2 = int(float(region["y2"]) * image.shape[0])
+        except (KeyError, TypeError, ValueError):
+            continue
+        manual_color = (180, 40, 180) if region.get("is_tampered") else (120, 120, 40)
+        cv2.rectangle(image, (x1, y1), (x2, y2), manual_color, 2)
+        source = str(region.get("source") or "local_manual")
+        label = f"manual {region.get('field_type')} tampered={region.get('is_tampered')} {source}"
+        cv2.putText(image, label, (x1, min(image.shape[0] - 6, y2 + 31)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, manual_color, 1, cv2.LINE_AA)
     cv2.putText(image, f"{row['expected']} -> {row['result']} {float(row['confidence']):.3f}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
     cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])[1].tofile(str(target))
+
+
+def _draw_dashed_rectangle(
+    image: np.ndarray,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    x1, y1 = start
+    x2, y2 = end
+    for left, top, right, bottom in ((x1, y1, x2, y1), (x2, y1, x2, y2), (x2, y2, x1, y2), (x1, y2, x1, y1)):
+        length = max(abs(right - left), abs(bottom - top))
+        if length == 0:
+            continue
+        for offset in range(0, length, 12):
+            begin = offset / length
+            finish = min(1.0, (offset + 7) / length)
+            p1 = (int(left + (right - left) * begin), int(top + (bottom - top) * begin))
+            p2 = (int(left + (right - left) * finish), int(top + (bottom - top) * finish))
+            cv2.line(image, p1, p2, color, 1, cv2.LINE_AA)
 
 
 def _decision_thresholds(engine: Any) -> dict[str, float]:
@@ -346,6 +503,10 @@ def _write_charts(output_dir: Path, rows: list[dict[str, Any]], metrics: dict[st
     independent = [row for row in rows if row["cohort"] == "independent"]
     _draw_risk_distribution_chart(independent, chart_dir / "risk_distribution.png")
     _draw_outcome_counts_chart(metrics["independent"]["result_counts"], chart_dir / "outcome_counts.png")
+    for split in SPLIT_NAMES:
+        split_rows = [row for row in independent if row.get("split") == split]
+        _draw_risk_distribution_chart(split_rows, chart_dir / f"risk_distribution_{split}.png")
+        _draw_outcome_counts_chart(metrics["splits"][split]["result_counts"], chart_dir / f"outcome_counts_{split}.png")
 
 
 def _chart_canvas(title: str, width: int = 980, height: int = 560) -> np.ndarray:
@@ -442,15 +603,25 @@ def _markdown_report(metrics: dict[str, Any], failures: Sequence[dict[str, Any]]
     lines = [
         "# v3 Production Retest",
         "",
-        f"- Independent: {independent['strict_correct']}/{independent['sample_count']} ({independent['strict_accuracy']:.1%})",
-        f"- Normal recall: {independent['normal_recall']:.1%}",
-        f"- Tampered recall: {independent['tampered_recall']:.1%}",
-        f"- ROI coverage: {independent['roi_coverage']:.1%}",
+        f"- Non-replay aggregate (compatibility only): {independent['strict_correct']}/{independent['sample_count']} ({independent['strict_accuracy']:.1%})",
         f"- Production thresholds: suspicious {metrics['decision_thresholds']['suspicious']:.2f}, tampered {metrics['decision_thresholds']['tampered']:.2f}",
         f"- Replay: {replay['strict_correct']}/{replay['sample_count']} ({replay['strict_accuracy']:.1%})",
         "",
-        "## Failures",
+        "## Frozen Split Metrics",
     ]
+    for split in SPLIT_NAMES:
+        item = metrics["splits"][split]
+        balanced = item.get("balanced_accuracy")
+        balanced_text = f"{balanced:.1%}" if balanced is not None else "N/A"
+        lines.append(
+            f"- {split}: {item['strict_correct']}/{item['sample_count']} "
+            f"(normal recall {item['normal_recall']:.1%}; tampered recall {item['tampered_recall']:.1%}; "
+            f"balanced accuracy {balanced_text}; ROI coverage {item['roi_coverage']:.1%})"
+        )
+    lines.extend([
+        "",
+        "## Failures",
+    ])
     for row in failures:
         lines.append(f"- `{row['filename']}`: expected {row['expected']}, got {row['result']} ({row['confidence']:.4f}); {row['reason']}")
     lines.extend(["", "## Training Replay Details"])

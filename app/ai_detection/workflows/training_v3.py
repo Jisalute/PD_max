@@ -19,11 +19,12 @@ import numpy as np
 import re
 import xgboost as xgb
 import yaml
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, recall_score
+from sklearn.model_selection import StratifiedGroupKFold
 from PIL import Image
 
 from app.ai_detection.core.augmentations import build_global_augmentations, build_roi_augmentations
+from app.ai_detection.core.dataset_policy import is_v3_baseline_sample
 from app.ai_detection.core.detectors import OriginalityChecker
 from app.ai_detection.core.extractors import FeatureExtractor, FontFeatureLibrary
 from app.ai_detection.core.known_source_matcher import image_phash_hex
@@ -32,6 +33,34 @@ from app.ai_detection.core.ocr_utils import _resize_for_ocr
 from app.ai_detection.runtime.paths import legacy_annotation_dir, resolve_config_path
 
 logger = logging.getLogger(__name__)
+
+
+V3_XGB_PROFILES = (
+    {
+        "name": "shallow",
+        "max_depth": 2,
+        "n_estimators": 100,
+        "min_child_weight": 5,
+        "reg_alpha": 0.25,
+        "reg_lambda": 3.0,
+    },
+    {
+        "name": "balanced",
+        "max_depth": 3,
+        "n_estimators": 120,
+        "min_child_weight": 5,
+        "reg_alpha": 0.2,
+        "reg_lambda": 4.0,
+    },
+    {
+        "name": "strong_regularization",
+        "max_depth": 3,
+        "n_estimators": 80,
+        "min_child_weight": 8,
+        "reg_alpha": 0.5,
+        "reg_lambda": 6.0,
+    },
+)
 
 
 def write_version_manifest(
@@ -215,7 +244,7 @@ class TrainPipeline:
             new_font_lib.save(font_lib_path)
             logger.info("字体库已保存: %s (共 %d 条)", font_lib_path, len(all_font_labels))
 
-        # 训练全局模型（含 Platt 校准 + 早停）
+        # 训练全局模型；阈值仅由独立验证组决定，避免模板相近样本泄漏。
         X = np.array(global_X)
         y = np.array(global_y)
         groups = np.array(global_groups)
@@ -241,48 +270,22 @@ class TrainPipeline:
                 validation_ratio=0.20,
             )
         validation_mask = np.isin(groups, list(validation_groups))
+        train_mask = np.isin(groups, list(train_groups))
         if not validation_mask.any() or validation_mask.all():
             validation_mask = np.zeros(len(X), dtype=bool)
-        X_train, y_train = X[~validation_mask], y[~validation_mask]
+        if not train_mask.any():
+            train_mask = ~validation_mask
+        X_train, y_train = X[train_mask], y[train_mask]
+        train_group_values = groups[train_mask]
         X_val, y_val = X[validation_mask], y[validation_mask]
 
-        negative_count = max(1, int(np.sum(y_train == 0)))
-        positive_count = max(1, int(np.sum(y_train == 1)))
-        scale_pos_weight = negative_count / positive_count
-
-        base_model = xgb.XGBClassifier(
-            max_depth=4,
-            n_estimators=200,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            eval_metric="logloss",
-            random_state=42,
-            n_jobs=2,
-            scale_pos_weight=scale_pos_weight,
-        )
-
-        if X_val is not None and len(X_val) > 0:
-            base_model.fit(
-                X_train, y_train,
-                eval_set=[(X_val, y_val)],
-                verbose=False,
-            )
-        else:
-            base_model.fit(X_train, y_train)
-
-        # Platt scaling 校准：将 XGBoost 原始概率映射到校准概率
-        can_calibrate = (
-            len(np.unique(y_train)) == 2
-            and min(int(np.sum(y_train == 0)), int(np.sum(y_train == 1))) >= 6
-        )
-        if can_calibrate:
-            model = CalibratedClassifierCV(base_model, method="sigmoid", cv=3)
-            model.fit(X_train, y_train)
-        else:
-            model = base_model
+        profile_selection = self._select_xgb_profile(X_train, y_train, train_group_values)
+        selected_profile = dict(profile_selection["selected_profile"])
+        base_model = self._build_xgb_model(selected_profile, y_train)
+        base_model.fit(X_train, y_train, verbose=False)
+        # 小规模分组数据的交叉校准会破坏类别排序，直接保留原始概率并由验证组选择阈值。
+        model = base_model
+        can_calibrate = False
 
         model_path = str(version_dir / "global_layout_model.pkl")
         joblib.dump(model, model_path)
@@ -307,6 +310,8 @@ class TrainPipeline:
             "validation_groups": sorted(validation_groups),
             "training_groups": sorted(train_groups),
             "calibrated": can_calibrate,
+            "cross_validation": profile_selection,
+            "selected_xgb_profile": selected_profile,
             "global_fake_threshold": decision_threshold,
             "evaluation": evaluation,
             "active_evaluation": active_evaluation,
@@ -339,6 +344,142 @@ class TrainPipeline:
 
         logger.info("训练完成: %s", json.dumps(summary, ensure_ascii=False))
         return summary
+
+    @staticmethod
+    def _profile_complexity(profile: Dict[str, Any]) -> tuple[float, ...]:
+        """分数相同时优先选择更简单且正则更强的配置。"""
+        return (
+            float(profile["max_depth"]),
+            float(profile["n_estimators"]),
+            -float(profile["min_child_weight"]),
+            -float(profile["reg_alpha"]),
+            -float(profile["reg_lambda"]),
+        )
+
+    @staticmethod
+    def _build_xgb_model(profile: Dict[str, Any], labels: np.ndarray) -> xgb.XGBClassifier:
+        negative_count = max(1, int(np.sum(labels == 0)))
+        positive_count = max(1, int(np.sum(labels == 1)))
+        return xgb.XGBClassifier(
+            max_depth=int(profile["max_depth"]),
+            n_estimators=int(profile["n_estimators"]),
+            min_child_weight=float(profile["min_child_weight"]),
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=float(profile["reg_alpha"]),
+            reg_lambda=float(profile["reg_lambda"]),
+            eval_metric="logloss",
+            random_state=42,
+            n_jobs=2,
+            scale_pos_weight=negative_count / positive_count,
+        )
+
+    @classmethod
+    def _select_xgb_profile(
+        cls,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        train_groups: np.ndarray,
+    ) -> Dict[str, Any]:
+        """仅在冻结 train 组内选择配置，增强样本共享原图 group_id。"""
+        profiles = [dict(profile) for profile in V3_XGB_PROFILES]
+        group_labels: Dict[str, set[int]] = {}
+        for group, label in zip(train_groups, y_train):
+            group_labels.setdefault(str(group), set()).add(int(label))
+        class_group_counts = {
+            label: sum(label in labels for labels in group_labels.values())
+            for label in (0, 1)
+        }
+        base = {
+            "strategy": "StratifiedGroupKFold",
+            "n_splits": 5,
+            "shuffle": True,
+            "random_state": 42,
+            "train_sample_count": int(len(y_train)),
+            "train_group_count": len(group_labels),
+            "class_group_counts": class_group_counts,
+            "profiles": [],
+        }
+        if len(np.unique(y_train)) < 2 or min(class_group_counts.values()) < 5:
+            selected = profiles[0]
+            base.update(
+                {
+                    "available": False,
+                    "reason": "训练组中每类独立组不足 5 个，无法执行分层分组 5 折",
+                    "selected_profile": selected,
+                }
+            )
+            return base
+
+        splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+        try:
+            folds = list(splitter.split(X_train, y_train, train_groups))
+        except ValueError as exc:
+            selected = profiles[0]
+            base.update({"available": False, "reason": str(exc), "selected_profile": selected})
+            return base
+
+        for profile in profiles:
+            fold_rows = []
+            scores = []
+            for fold_number, (fit_indices, fold_indices) in enumerate(folds, start=1):
+                fit_groups = sorted({str(group) for group in train_groups[fit_indices]})
+                fold_groups = sorted({str(group) for group in train_groups[fold_indices]})
+                if set(fit_groups).intersection(fold_groups):
+                    raise RuntimeError("分组交叉验证发生 group 泄漏")
+                model = cls._build_xgb_model(profile, y_train[fit_indices])
+                model.fit(X_train[fit_indices], y_train[fit_indices], verbose=False)
+                metrics = cls._evaluation_metrics(
+                    model,
+                    X_train[fold_indices],
+                    y_train[fold_indices],
+                    threshold=0.5,
+                )
+                score = metrics.get("balanced_accuracy")
+                if score is not None:
+                    scores.append(float(score))
+                fold_rows.append(
+                    {
+                        "fold": fold_number,
+                        "fit_group_ids": fit_groups,
+                        "validation_group_ids": fold_groups,
+                        "sample_count": int(len(fold_indices)),
+                        "metrics": metrics,
+                    }
+                )
+            base["profiles"].append(
+                {
+                    "profile": profile,
+                    "folds": fold_rows,
+                    "mean_balanced_accuracy": float(np.mean(scores)) if scores else None,
+                    "std_balanced_accuracy": float(np.std(scores)) if scores else None,
+                    "available": len(scores) == len(folds),
+                    "complexity": list(cls._profile_complexity(profile)),
+                }
+            )
+
+        valid = [item for item in base["profiles"] if item["available"]]
+        if not valid:
+            selected = profiles[0]
+            base.update(
+                {
+                    "available": False,
+                    "reason": "至少一个折次缺少双类别指标，无法比较配置",
+                    "selected_profile": selected,
+                }
+            )
+            return base
+        winner = min(
+            valid,
+            key=lambda item: (
+                -float(item["mean_balanced_accuracy"]),
+                float(item["std_balanced_accuracy"]),
+                tuple(float(value) for value in item["complexity"]),
+            ),
+        )
+        base.update({"available": True, "selected_profile": dict(winner["profile"])})
+        return base
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -421,6 +562,8 @@ class TrainPipeline:
                 "active_evaluation": summary["active_evaluation"],
                 "test_evaluation": summary.get("test_evaluation"),
                 "training_replay_evaluation": summary.get("training_replay_evaluation"),
+                "cross_validation": summary.get("cross_validation"),
+                "selected_xgb_profile": summary.get("selected_xgb_profile"),
                 "global_fake_threshold": summary.get("global_fake_threshold"),
                 "source_counts": summary.get("source_counts"),
                 "manifest_path": summary["manifest_path"],
@@ -528,7 +671,7 @@ class TrainPipeline:
                     label = int(row["label"])
                     split = str(row["split"])
                     group = str(row["group_id"])
-                    if bool(row.get("is_derived")) or split == "derived":
+                    if not is_v3_baseline_sample(row):
                         continue
                     raw_path = Path(str(row["path"]))
                     path = (img_dir / raw_path).resolve()
@@ -839,6 +982,8 @@ class TrainPipeline:
             "model_internal_validation": summary.get("evaluation"),
             "model_internal_test": summary.get("test_evaluation"),
             "training_replay_global_feature_only": summary.get("training_replay_evaluation"),
+            "cross_validation": summary.get("cross_validation"),
+            "selected_xgb_profile": summary.get("selected_xgb_profile"),
             "threshold": summary.get("global_fake_threshold"),
             "source_counts": summary.get("source_counts"),
             "note": "训练内指标仅衡量全图特征模型；候选启用前必须另行运行生产端到端 OCR/ROI 评估。",
@@ -853,7 +998,16 @@ class TrainPipeline:
             writer = csv.DictWriter(stream, fieldnames=["cohort", "image_path", "global_prediction"])
             writer.writeheader()
             writer.writerows(rows)
-        markdown = ["# v3 Training Result", "", f"- Version: `{summary.get('timestamp')}`", f"- Threshold: `{summary.get('global_fake_threshold')}`", "", "该目录的全图特征指标不替代生产 OCR/ROI 端到端评估。"]
+        selected = summary.get("selected_xgb_profile") or {}
+        markdown = [
+            "# v3 Training Result",
+            "",
+            f"- Version: `{summary.get('timestamp')}`",
+            f"- Selected profile: `{selected.get('name', 'unknown')}`",
+            f"- Threshold: `{summary.get('global_fake_threshold')}`",
+            "",
+            "该目录的全图特征指标不替代生产 OCR/ROI 端到端评估。",
+        ]
         (reports_dir / "report.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
 
     def _generate_visualizations(self, model, X, y, chart_dir: Path, timestamp: str) -> list:

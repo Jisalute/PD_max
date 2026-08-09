@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""规则类鉴伪检测：像素重叠与时间戳（与 AI 模型鉴伪解耦，供独立接口与引擎复用）。"""
+"""规则类鉴伪检测：像素重叠、时间戳与单据语义（与 AI 模型鉴伪解耦）。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,6 +9,11 @@ import cv2
 import yaml
 
 from app.ai_detection.core.detectors import PixelLevelDetector
+from app.ai_detection.core.ai_watermark import (
+    detect_doubao_ai_watermark,
+    detect_doubao_ai_watermark_template,
+)
+from app.ai_detection.core.semantic_checker import check_receipt_semantics
 from app.ai_detection.core.utils import safe_read_image
 from app.ai_detection.core.rule_check_roi import find_suggested_rois
 from app.ai_detection.core.timestamp_checker import check_image_timestamps
@@ -373,6 +378,32 @@ def merge_pixel_overlap_results(
     return merged
 
 
+def build_ai_watermark_hard_tamper_result(watermark_evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """构造不依赖 ROI 推理的水印硬判规则结果。"""
+    reason = str(watermark_evidence.get("reason") or "识别到 AI 水印，按业务规则直接判定篡改")
+    return {
+        "pixel_overlap": None,
+        "pixel_overlap_source": None,
+        "suggested_rois": None,
+        "timestamp": None,
+        "semantic": {
+            "semantic_check": {"ai_watermark": watermark_evidence},
+            "anomalies": ["doubao_ai_generated_watermark"],
+            "reasons": [reason],
+            "risk": 1.0,
+            "hard_tamper": True,
+        },
+        "ai_watermark": watermark_evidence,
+        "hard_tamper_flags": {
+            "pixel_overlap": False,
+            "timestamp": False,
+            "semantic": True,
+            "doubao_ai_watermark": True,
+        },
+        "reason": reason,
+    }
+
+
 def run_rule_checks(
     image_path: str,
     pixel_detector: PixelLevelDetector,
@@ -388,7 +419,7 @@ def run_rule_checks(
     corroboration_signals: Optional[Dict[str, bool]] = None,
     image_bgr: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """聚合规则检测：像素重叠（手动传入 bbox/bboxes 时执行）+ 时间戳。
+    """聚合规则检测：像素重叠（手动传入 bbox/bboxes 时执行）+ 时间戳 + 语义。
 
     未传 bbox/bboxes 时通过 OCR 定位建议检测区域（suggested_rois），供前端展示勾选。
 
@@ -445,16 +476,32 @@ def run_rule_checks(
         business_datetime=business_datetime,
         thresholds=thresh,
     )
+    effective_image = image_bgr if image_bgr is not None else safe_read_image(image_path)
+    watermark_evidence = detect_doubao_ai_watermark(ocr_tokens or [])
+    if watermark_evidence is None:
+        watermark_evidence = detect_doubao_ai_watermark_template(effective_image)
+
+    semantic = check_receipt_semantics(
+        image_path,
+        ocr_tokens=ocr_tokens,
+        image_shape=image_shape,
+        thresholds=thresh,
+        watermark_evidence=watermark_evidence,
+    )
 
     reasons: List[str] = []
     if pixel_overlap and pixel_overlap.get("reasons"):
         reasons.extend(pixel_overlap["reasons"])
     if timestamp.get("reasons"):
         reasons.extend(timestamp["reasons"])
+    if semantic.get("reasons"):
+        reasons.extend(semantic["reasons"])
 
     hard_tamper_flags = {
         "pixel_overlap": bool(pixel_overlap and pixel_overlap.get("hard_tamper")),
         "timestamp": bool(timestamp.get("hard_tamper")),
+        "semantic": bool(semantic.get("hard_tamper")),
+        "doubao_ai_watermark": bool(watermark_evidence and watermark_evidence.get("hard_tamper")),
     }
 
     return {
@@ -462,6 +509,8 @@ def run_rule_checks(
         "pixel_overlap_source": pixel_overlap_source,
         "suggested_rois": suggested_rois,
         "timestamp": timestamp,
+        "semantic": semantic,
+        "ai_watermark": watermark_evidence,
         "hard_tamper_flags": hard_tamper_flags,
         "reason": "；".join(dict.fromkeys(reasons)) if reasons else "未检出明显规则类异常",
     }

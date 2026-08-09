@@ -282,6 +282,8 @@ class FeedbackManager:
                     "second_reviewer": source.get("reviewer"),
                     "second_review_note": source.get("note", ""),
                     "second_review_regions": record.get("regions") or [],
+                    "second_review_schema_version": source.get("schema_version", 1),
+                    "roi_truth_status": record.get("roi_truth_status", "unknown"),
                 }
             )
             self._write_metadata(metadata_path, metadata)
@@ -302,6 +304,7 @@ class FeedbackManager:
         reviewer: str,
         note: str = "",
         regions: Optional[List[Dict[str, Any]]] = None,
+        schema_version: int = 1,
     ) -> Optional[Dict[str, Any]]:
         """Apply an explicit truth label and link the feedback to reviewed training data."""
         folder = self._find_entry_folder(entry_folder)
@@ -323,6 +326,7 @@ class FeedbackManager:
                     reviewer=reviewer,
                     note=note,
                     regions=regions,
+                    schema_version=schema_version,
                 )
 
         record = self.reviewed.add_review(
@@ -341,6 +345,7 @@ class FeedbackManager:
             reviewer=reviewer,
             note=note,
             regions=regions,
+            schema_version=schema_version,
         )
         self._sync_review_links(record)
         return self._read_entry(folder)
@@ -424,6 +429,7 @@ class FeedbackManager:
         original_filename: Optional[str] = None,
         label: Optional[int] = None,
         regions: Optional[List[Dict[str, Any]]] = None,
+        schema_version: int = 1,
         reviewer: str,
         note: str = "",
     ) -> Dict[str, Any]:
@@ -434,6 +440,7 @@ class FeedbackManager:
             regions=regions,
             reviewer=reviewer,
             note=note,
+            schema_version=schema_version,
         )
         self._sync_review_links(record)
         return record

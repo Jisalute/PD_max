@@ -1,0 +1,51 @@
+{
+  "task_id": "dfeb0e98-a38d-48fb-bf07-60260f9d0c86",
+  "judgment": "correct",
+  "timestamp": "20260729_171646",
+  "bbox": [
+    202,
+    148,
+    453,
+    217
+  ],
+  "engine_result": {
+    "bbox": [
+      202,
+      148,
+      251,
+      69
+    ],
+    "reason": "全局UI布局异常",
+    "result": "篡改",
+    "region_no": 1,
+    "confidence": 0.66,
+    "field_type": "amount",
+    "field_label": "金额",
+    "original_bbox": [
+      202,
+      148,
+      453,
+      217
+    ],
+    "hard_tamper_flags": {
+      "bbox_iou": false
+    },
+    "bbox_overlap_check": {
+      "max_iou": 0.0,
+      "anomalies": [],
+      "box_count": 2,
+      "risk_max_iou": 0.0,
+      "overlapping_pairs": []
+    }
+  },
+  "user_note": "result_index:0",
+  "entry_id": "6ff22b9b",
+  "original_image": "/home/ubuntu/var/www/PD_max/app/ai_detection/services/feedback/correct/20260729_171646_dfeb0e98-a38d-48fb-bf07-60260f9d0c86_6ff22b9b/original.jpg",
+  "cropped_roi": null,
+  "original_filename": "冯海涛_2076593545407803392_1.jpg",
+  "content_sha256": "72efb30a2297908449e943e549a28511a6d9b14b957d4332c62fa1581c749883",
+  "size_bytes": 81217,
+  "media_type": "image/jpeg",
+  "initial_reviewer": "anonymous",
+  "review_status": "pending"
+}
