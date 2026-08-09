@@ -33,3 +33,4 @@ CLAUDE.md
 .pytest_cache
 /tests
 *.jpg
+*.png
