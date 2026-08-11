@@ -10,7 +10,10 @@ import tempfile
 import pandas as pd
 
 from app.intelligent_prediction.logging_utils import get_logger
-from app.intelligent_prediction.db import get_prediction_session_factory
+from app.intelligent_prediction.db import (
+    dispose_prediction_engine,
+    get_prediction_session_factory,
+)
 from app.intelligent_prediction.models import PredictionBatch
 from app.intelligent_prediction.schemas.doubao_prediction import DoubaoBatchRequest
 from app.intelligent_prediction.services.ai_client import get_ai_client
@@ -350,11 +353,23 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
 
 @celery_app.task(name="intelligent_prediction.run_daily_ai_prediction")
 def run_daily_ai_prediction_task(batch_id: str) -> str:
-    asyncio.run(_run_daily_prediction_async(batch_id))
+    async def _run_with_cleanup() -> None:
+        try:
+            await _run_daily_prediction_async(batch_id)
+        finally:
+            await dispose_prediction_engine()
+
+    asyncio.run(_run_with_cleanup())
     return batch_id
 
 
 @celery_app.task(name="intelligent_prediction.run_prediction_batch")
 def run_prediction_batch_task(batch_id: str) -> str:
-    asyncio.run(_run_batch_async(batch_id))
+    async def _run_with_cleanup() -> None:
+        try:
+            await _run_batch_async(batch_id)
+        finally:
+            await dispose_prediction_engine()
+
+    asyncio.run(_run_with_cleanup())
     return batch_id
