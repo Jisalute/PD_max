@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
+import hashlib
+import json
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +24,21 @@ from app.intelligent_prediction.schemas.doubao_prediction import (
 
 _DAILY_PREDICTION_TYPE = "manual"
 _DAILY_PREDICTION_HORIZON_DAYS = 16
+
+
+def build_smm_price_fingerprint(items) -> str:
+    """生成本次预测使用的 SMM 铅价指纹，用于判断报价是否发生变化。"""
+    payload = []
+    for item in items or []:
+        if hasattr(item, "model_dump"):
+            value = item.model_dump(mode="json")
+        elif isinstance(item, dict):
+            value = item
+        else:
+            value = str(item)
+        payload.append(value)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 async def latest_daily_prediction_batch_id(session: AsyncSession) -> str | None:
