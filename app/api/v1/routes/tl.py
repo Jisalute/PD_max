@@ -3205,8 +3205,8 @@ def get_daily_ai_prediction_status(
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, status, error_message, meta, "
-                    "DATE_FORMAT(CONVERT_TZ(created_at, '+00:00', '+08:00'), '%Y-%m-%d %H:%i:%s'), "
-                    "DATE_FORMAT(CONVERT_TZ(completed_at, '+00:00', '+08:00'), '%Y-%m-%d %H:%i:%s') "
+                    "DATE_FORMAT(CONVERT_TZ(created_at, '+00:00', '+08:00'), '%%Y-%%m-%%d %%H:%%i:%%s'), "
+                    "DATE_FORMAT(CONVERT_TZ(completed_at, '+00:00', '+08:00'), '%%Y-%%m-%%d %%H:%%i:%%s') "
                     "FROM pd_ip_prediction_batches WHERE id = %s",
                     (batch_id,),
                 )
