@@ -20,6 +20,7 @@ temp/
 logs/
 .cache/
 app/ai_detection/feedback/*
+app/ai_detection/services/feedback/
 
 # 4. IDE 与系统配置文件
 .vscode/
