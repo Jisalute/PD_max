@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.ai_detection.core.amount_candidates import (
     AmountCandidate,
+    ACCOUNT_CONTEXT_KEYWORDS,
     DATE_PATTERN,
     MASKED_ACCOUNT_PATTERN,
     OCRToken,
@@ -14,6 +15,9 @@ from app.ai_detection.core.amount_candidates import (
     TIME_PATTERN,
     bbox_iou,
     build_amount_candidates,
+    find_uppercase_amount_pairs,
+    group_tokens_by_line,
+    is_account_context_token,
     looks_like_clock_time,
 )
 from app.ai_detection.core.semantic_checker import find_labeled_field_bbox
@@ -61,7 +65,7 @@ _LABELED_CURRENCY_AMOUNT_PATTERN = re.compile(
 _CURRENCY_AMOUNT_VALUE_PATTERN = re.compile(
     r"[+\-]?(?:[¥￥])?\d[\d,]*(?:[.:]\d{2})?元"
 )
-_TRANSFER_CONTEXT_PATTERN = re.compile(r"(?:转给|转账|收款|付款|金额)")
+_TRANSFER_CONTEXT_PATTERN = re.compile(r"(?:转给|转出|转入|转账|交易金额|转账金额|收款金额|付款金额|金额)")
 
 
 def _is_direct_datetime_candidate(text: str) -> bool:
@@ -127,6 +131,8 @@ def _nearby_labeled_currency_amount_tokens(tokens: Sequence[OCRToken]) -> List[O
         for value in tokens:
             if value is label or not _CURRENCY_AMOUNT_VALUE_PATTERN.search(value.clean_text):
                 continue
+            if is_account_context_token(value, tokens):
+                continue
             vertical_gap = abs(value.center_y - label.center_y)
             maximum_gap = max(label.height, value.height) * 3.0
             if vertical_gap <= maximum_gap:
@@ -141,6 +147,8 @@ def _nearby_transfer_amount_tokens(
     image_h, image_w = image_shape[:2]
     values: List[OCRToken] = []
     for value in tokens:
+        if is_account_context_token(value, tokens):
+            continue
         digit_count = len(re.findall(r"\d", value.clean_text))
         if not 4 <= digit_count <= 9:
             continue
@@ -158,12 +166,30 @@ def _nearby_transfer_amount_tokens(
         for context in tokens:
             if context is value or not _TRANSFER_CONTEXT_PATTERN.search(context.clean_text):
                 continue
+            if "凭证" in context.clean_text and "金额" not in context.clean_text:
+                continue
             vertical_gap = max(0, value.bbox[1] - context.bbox[3])
             maximum_gap = max(value.height, context.height) * 2.5
             if vertical_gap <= maximum_gap:
                 values.append(value)
                 break
     return values
+
+
+def _find_name_field_bbox(tokens: Sequence[OCRToken], label: str) -> Optional[List[int]]:
+    """姓名标签命中账号字段时跳过，避免把账号值误送入 v3 姓名 ROI。"""
+    for line in group_tokens_by_line(tokens):
+        if not any(label in token.clean_text for token in line):
+            continue
+        if any(
+            label in token.clean_text and any(keyword in token.clean_text for keyword in ACCOUNT_CONTEXT_KEYWORDS)
+            for token in line
+        ):
+            continue
+        bbox = find_labeled_field_bbox(line, label)
+        if bbox is not None:
+            return bbox
+    return None
 
 
 def _dedupe_rois(
@@ -196,6 +222,7 @@ def _add_key_field_roi(
     priority: int,
     text: str,
     source: str,
+    metadata: Optional[Dict[str, Any]] = None,
     iou_threshold: float = 0.80,
 ) -> None:
     if len(bbox_xyxy) < 4:
@@ -206,17 +233,18 @@ def _add_key_field_roi(
     if any(bbox_iou(bbox_tuple, seen) >= iou_threshold for seen in seen_bboxes):
         return
     seen_bboxes.append(bbox_tuple)
-    rois.append(
-        {
-            "bbox": [int(v) for v in bbox_tuple],
-            "field_type": field_type,
-            "field_label": field_label,
-            "label": text or field_label,
-            "category": field_label,
-            "priority": priority,
-            "source": source,
-        }
-    )
+    roi = {
+        "bbox": [int(v) for v in bbox_tuple],
+        "field_type": field_type,
+        "field_label": field_label,
+        "label": text or field_label,
+        "category": field_label,
+        "priority": priority,
+        "source": source,
+    }
+    if metadata:
+        roi.update(metadata)
+    rois.append(roi)
 
 
 def find_key_field_rois(
@@ -234,9 +262,41 @@ def find_key_field_rois(
     rois: List[Dict[str, Any]] = []
     seen_bboxes: List[Tuple[int, int, int, int]] = []
 
+    for pair in find_uppercase_amount_pairs(tokens):
+        comparison = {
+            key: pair[key]
+            for key in ("pair_id", "small_amount", "uppercase_amount", "comparison_available", "consistent", "reason")
+        }
+        _add_key_field_roi(
+            rois,
+            seen_bboxes,
+            pair["small_bbox"],
+            field_type="amount",
+            field_label="金额",
+            priority=1,
+            text=pair["small_text"][:32],
+            source="ocr_lowercase_amount_pair",
+            metadata={"amount_consistency": {**comparison, "role": "small"}},
+        )
+        _add_key_field_roi(
+            rois,
+            seen_bboxes,
+            pair["uppercase_bbox"],
+            field_type="amount",
+            field_label="金额",
+            priority=1,
+            text=pair["uppercase_text"][:32],
+            source="ocr_uppercase_amount_pair",
+            metadata={"amount_consistency": {**comparison, "role": "uppercase"}},
+        )
+
     for labels, field_type, field_label, priority in KEY_FIELD_ROI_CATEGORIES:
         for label_text in labels:
-            bbox = find_labeled_field_bbox(tokens, label_text)
+            bbox = (
+                _find_name_field_bbox(tokens, label_text)
+                if field_type == "name"
+                else find_labeled_field_bbox(tokens, label_text)
+            )
             if bbox is None:
                 continue
             _add_key_field_roi(
@@ -280,6 +340,8 @@ def find_key_field_rois(
 
     for token in tokens:
         if not _CURRENCY_AMOUNT_VALUE_PATTERN.search(token.clean_text):
+            continue
+        if is_account_context_token(token, tokens):
             continue
         _add_key_field_roi(
             rois,

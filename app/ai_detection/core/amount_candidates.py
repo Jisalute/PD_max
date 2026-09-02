@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -16,6 +17,32 @@ DATE_PATTERN = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
 TIME_PATTERN = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?")
 ORDER_PATTERN = re.compile(r"\d{10,}")
 MASKED_ACCOUNT_PATTERN = re.compile(r"\d{3,}\*+\d{2,}")
+ACCOUNT_CONTEXT_KEYWORDS = ("账户", "账号", "银行卡", "卡号", "开户行")
+UPPERCASE_AMOUNT_UNITS = {"拾": 10, "十": 10, "佰": 100, "百": 100, "仟": 1000, "千": 1000}
+UPPERCASE_AMOUNT_SECTION_UNITS = {"万": 10_000, "亿": 100_000_000}
+UPPERCASE_AMOUNT_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "壹": 1,
+    "一": 1,
+    "贰": 2,
+    "二": 2,
+    "叁": 3,
+    "三": 3,
+    "肆": 4,
+    "四": 4,
+    "伍": 5,
+    "五": 5,
+    "陆": 6,
+    "六": 6,
+    "柒": 7,
+    "七": 7,
+    "捌": 8,
+    "八": 8,
+    "玖": 9,
+    "九": 9,
+}
+UPPERCASE_AMOUNT_MARKERS = frozenset({"拾", "十", "佰", "百", "仟", "千", "万", "亿", "圆", "元", "整", "角", "分"})
 
 TARGET_AMOUNT_KEYWORDS = ("金额", "小写", "转账金额", "交易金额", "收款金额", "付款金额", "支出", "收入", "到账", "转出", "转入")
 GENERIC_CURRENCY_KEYWORDS = ("人民币", "¥", "￥", "元")
@@ -212,6 +239,8 @@ def build_fallback_amount_candidates(tokens: Sequence[OCRToken], image_shape: Tu
 
     for token in tokens:
         clean_text = token.clean_text
+        if is_account_context_token(token, tokens):
+            continue
         digit_count = len(re.findall(r"\d", clean_text))
         if digit_count < 4:
             continue
@@ -299,10 +328,205 @@ def group_tokens_by_line(tokens: Sequence[OCRToken]) -> List[List[OCRToken]]:
     return groups
 
 
+def _line_has_account_context(line: Sequence[OCRToken]) -> bool:
+    return any(any(keyword in token.clean_text for keyword in ACCOUNT_CONTEXT_KEYWORDS) for token in line)
+
+
+def is_account_context_token(token: OCRToken, tokens: Sequence[OCRToken]) -> bool:
+    """判断数字 token 是否是账号标签右侧的值，兼容 OCR 将脱敏账号拆成多段。"""
+    for line in group_tokens_by_line(tokens):
+        if not any(item is token for item in line):
+            continue
+        for label in line:
+            if not any(keyword in label.clean_text for keyword in ACCOUNT_CONTEXT_KEYWORDS):
+                continue
+            if token is label:
+                return False
+            # 账号字段的数值通常位于标签右侧；该行任意拆分片段均不能作为金额候选。
+            if token.bbox[2] > label.bbox[2] - max(4, int(label.width * 0.10)):
+                return True
+    return False
+
+
+def parse_decimal_amount(text: str) -> Optional[Decimal]:
+    """解析带小数或明确货币单位的阿拉伯金额，失败时返回 None。"""
+    clean = normalize_text(text).replace(",", "")
+    clean = re.sub(r"(?:小写|金额|人民币)", "", clean)
+    matches = re.findall(r"[+\-]?\d+(?:\.\d{1,2})?", clean)
+    if len(matches) != 1:
+        return None
+    value_text = matches[0]
+    if "." not in value_text and not any(unit in clean for unit in ("元", "圆", "¥")):
+        return None
+    try:
+        return Decimal(value_text)
+    except InvalidOperation:
+        return None
+
+
+def parse_chinese_uppercase_amount(text: str) -> Optional[Decimal]:
+    """严格解析财务中文大写金额；OCR 含未知字符时拒绝比较。"""
+    clean = normalize_text(text)
+    clean = re.sub(r"(?:人民币|大写|金额)", "", clean)
+    clean = re.sub(r"[\s:：,，。.;；]", "", clean)
+    if not clean:
+        return None
+
+    currency_positions = [index for index, char in enumerate(clean) if char in {"元", "圆"}]
+    if currency_positions:
+        integer_text = clean[: currency_positions[0]]
+        fraction_text = clean[currency_positions[0] + 1 :]
+    elif "整" in clean:
+        integer_text, _, fraction_text = clean.partition("整")
+    else:
+        return None
+
+    allowed = set(UPPERCASE_AMOUNT_DIGITS) | set(UPPERCASE_AMOUNT_UNITS) | set(UPPERCASE_AMOUNT_SECTION_UNITS) | {"角", "分", "整", "正"}
+    if not integer_text or any(char not in allowed for char in integer_text + fraction_text):
+        return None
+    if not any(char in UPPERCASE_AMOUNT_DIGITS for char in integer_text):
+        return None
+
+    total = 0
+    section = 0
+    number: Optional[int] = None
+    for char in integer_text:
+        if char in UPPERCASE_AMOUNT_DIGITS:
+            number = UPPERCASE_AMOUNT_DIGITS[char]
+        elif char in UPPERCASE_AMOUNT_UNITS:
+            section += (number if number is not None else 1) * UPPERCASE_AMOUNT_UNITS[char]
+            number = None
+        elif char in UPPERCASE_AMOUNT_SECTION_UNITS:
+            section += number or 0
+            total += section * UPPERCASE_AMOUNT_SECTION_UNITS[char]
+            section = 0
+            number = None
+        else:
+            return None
+    integer_value = total + section + (number or 0)
+
+    fraction = Decimal("0")
+    index = 0
+    while index < len(fraction_text):
+        char = fraction_text[index]
+        if char in {"整", "正"}:
+            index += 1
+            continue
+        if char not in UPPERCASE_AMOUNT_DIGITS or index + 1 >= len(fraction_text):
+            return None
+        unit = fraction_text[index + 1]
+        if unit == "角":
+            fraction += Decimal(UPPERCASE_AMOUNT_DIGITS[char]) / Decimal("10")
+        elif unit == "分":
+            fraction += Decimal(UPPERCASE_AMOUNT_DIGITS[char]) / Decimal("100")
+        else:
+            return None
+        index += 2
+    return Decimal(integer_value) + fraction
+
+
+def _merge_token_bbox(tokens: Sequence[OCRToken]) -> Tuple[int, int, int, int]:
+    return (
+        min(token.bbox[0] for token in tokens),
+        min(token.bbox[1] for token in tokens),
+        max(token.bbox[2] for token in tokens),
+        max(token.bbox[3] for token in tokens),
+    )
+
+
+def _lowercase_amount_line(line: Sequence[OCRToken]) -> Optional[Dict[str, Any]]:
+    text = normalize_text("".join(token.clean_text for token in line))
+    has_lowercase_label = "小写" in text or bool(re.search(r"小(?:写)?[:：.]?[+\-]?\d", text))
+    if not text or not has_lowercase_label:
+        return None
+    value_tokens = [token for token in line if parse_decimal_amount(token.clean_text) is not None]
+    amount = parse_decimal_amount(text)
+    if amount is None and len(value_tokens) == 1:
+        amount = parse_decimal_amount(value_tokens[0].clean_text)
+    if amount is None and not re.search(r"\d", text):
+        return None
+    bbox = _merge_token_bbox(value_tokens or line)
+    display_text = value_tokens[0].clean_text if len(value_tokens) == 1 else text
+    return {"bbox": bbox, "text": display_text, "amount": amount}
+
+
+def _uppercase_amount_line(line: Sequence[OCRToken]) -> Optional[Dict[str, Any]]:
+    text = normalize_text("".join(token.clean_text for token in line))
+    if not text:
+        return None
+    has_uppercase_label = "大写" in text or (text.startswith("大") and any(marker in text for marker in UPPERCASE_AMOUNT_MARKERS))
+    if not has_uppercase_label:
+        return None
+    return {"bbox": _merge_token_bbox(line), "text": text, "amount": parse_chinese_uppercase_amount(text)}
+
+
+def _decimal_text(value: Optional[Decimal]) -> Optional[str]:
+    return format(value, "f") if value is not None else None
+
+
+def find_uppercase_amount_pairs(tokens: Sequence[OCRToken]) -> List[Dict[str, Any]]:
+    """配对同列相邻的大写/小写金额，并保留 OCR 不可读时的比较状态。"""
+    lower_rows = [row for line in group_tokens_by_line(tokens) if (row := _lowercase_amount_line(line))]
+    upper_rows = [row for line in group_tokens_by_line(tokens) if (row := _uppercase_amount_line(line))]
+    pairs: List[Dict[str, Any]] = []
+    used_upper_bboxes: set[Tuple[int, int, int, int]] = set()
+
+    for lower in lower_rows:
+        lower_bbox = lower["bbox"]
+        lower_height = max(1, lower_bbox[3] - lower_bbox[1])
+        candidates: List[Dict[str, Any]] = []
+        for upper in upper_rows:
+            upper_bbox = upper["bbox"]
+            if upper_bbox in used_upper_bboxes:
+                continue
+            upper_height = max(1, upper_bbox[3] - upper_bbox[1])
+            vertical_distance = abs((lower_bbox[1] + lower_bbox[3]) / 2.0 - (upper_bbox[1] + upper_bbox[3]) / 2.0)
+            horizontal_overlap = max(0, min(lower_bbox[2], upper_bbox[2]) - max(lower_bbox[0], upper_bbox[0]))
+            if vertical_distance > max(lower_height, upper_height) * 4.0:
+                continue
+            if horizontal_overlap < min(lower_bbox[2] - lower_bbox[0], upper_bbox[2] - upper_bbox[0]) * 0.25:
+                continue
+            candidates.append(upper)
+        if not candidates:
+            continue
+        upper = min(
+            candidates,
+            key=lambda item: abs((lower_bbox[1] + lower_bbox[3]) - (item["bbox"][1] + item["bbox"][3])),
+        )
+        used_upper_bboxes.add(upper["bbox"])
+        lower_amount = lower["amount"]
+        upper_amount = upper["amount"]
+        comparison_available = lower_amount is not None and upper_amount is not None
+        consistent = lower_amount == upper_amount if comparison_available else None
+        if not comparison_available:
+            reason = "uppercase_ocr_unreadable" if upper_amount is None else "lowercase_ocr_unreadable"
+        elif consistent:
+            reason = "amount_uppercase_lowercase_consistent"
+        else:
+            reason = "amount_uppercase_lowercase_mismatch"
+        pairs.append(
+            {
+                "pair_id": f"amount_pair_{len(pairs) + 1}",
+                "small_bbox": [int(value) for value in lower_bbox],
+                "uppercase_bbox": [int(value) for value in upper["bbox"]],
+                "small_text": lower["text"],
+                "uppercase_text": upper["text"],
+                "small_amount": _decimal_text(lower_amount),
+                "uppercase_amount": _decimal_text(upper_amount),
+                "comparison_available": comparison_available,
+                "consistent": consistent,
+                "reason": reason,
+            }
+        )
+    return pairs
+
+
 def build_amount_candidates(tokens: Sequence[OCRToken], image_shape: Tuple[int, int, int]) -> List[AmountCandidate]:
     candidates: List[AmountCandidate] = []
 
     for token in tokens:
+        if is_account_context_token(token, tokens):
+            continue
         score, flags = score_amount_text(token.text, token.bbox, image_shape)
         if score <= 0 or not is_viable_amount_candidate(token.clean_text, flags):
             continue
@@ -319,6 +543,8 @@ def build_amount_candidates(tokens: Sequence[OCRToken], image_shape: Tuple[int, 
         )
 
     for line_tokens in group_tokens_by_line(tokens):
+        if _line_has_account_context(line_tokens):
+            continue
         merged_text = " ".join(token.text for token in line_tokens)
         clean_text = normalize_text(merged_text)
         bbox = (

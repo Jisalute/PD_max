@@ -94,11 +94,12 @@ def _image_info(path: Path) -> tuple[str, str, int, int]:
 def normalize_review_regions(
     label: int,
     regions: Optional[Sequence[Dict[str, Any]]],
+    *,
+    schema_version: int = 1,
 ) -> list[Dict[str, Any]]:
-    """Validate normalized review boxes and require them for tampered truth labels."""
-    if int(label) == 0:
-        return []
-
+    """校验二审框；v1 的缺失篡改真值必须继续视为未知。"""
+    if int(schema_version) not in {1, 2}:
+        raise ValueError("二审标注 schema_version 仅支持 1 或 2")
     normalized: list[Dict[str, Any]] = []
     for raw in regions or []:
         if not isinstance(raw, dict):
@@ -121,13 +122,33 @@ def normalize_review_regions(
             "y1": round(y1, 8),
             "x2": round(x2, 8),
             "y2": round(y2, 8),
+            "is_tampered": raw.get("is_tampered"),
+            "source": raw.get("source"),
         }
+        if item["is_tampered"] is not None and not isinstance(item["is_tampered"], bool):
+            raise ValueError("is_tampered 必须为布尔值或空")
+        if item["source"] is not None:
+            source = str(item["source"]).strip()
+            if len(source) > 128:
+                raise ValueError("source 长度不能超过 128")
+            item["source"] = source or None
         if item not in normalized:
             normalized.append(item)
 
-    if not normalized:
+    if int(label) == 1 and not normalized:
         raise ReviewRegionRequired("二审判定为篡改时，必须框选至少一个金额、姓名或时间区域")
+    if int(label) == 1 and int(schema_version) == 2 and not any(
+        item.get("is_tampered") is True for item in normalized
+    ):
+        raise ReviewRegionRequired("schema v2 的篡改二审必须至少标记一个实际篡改的金额、姓名或时间区域")
     return normalized
+
+
+def roi_truth_status(record: Dict[str, Any]) -> str:
+    regions = record.get("regions") if isinstance(record.get("regions"), list) else []
+    if any(isinstance(region, dict) and isinstance(region.get("is_tampered"), bool) for region in regions):
+        return "confirmed"
+    return "unknown"
 
 
 def _merge_source_regions(sources: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -240,6 +261,7 @@ class ReviewedDatasetManager:
         note: str,
         reviewed_at: str,
         regions: Sequence[Dict[str, Any]],
+        schema_version: int,
     ) -> Dict[str, Any]:
         source_id = str(source.get("source_id") or source.get("folder_name") or "").strip()
         if not source_id:
@@ -253,6 +275,7 @@ class ReviewedDatasetManager:
                 "reviewed_at": reviewed_at,
                 "note": str(note or ""),
                 "regions": [dict(region) for region in regions],
+                "schema_version": int(schema_version),
             }
         )
         return record
@@ -267,6 +290,7 @@ class ReviewedDatasetManager:
         reviewer: str,
         note: str = "",
         regions: Optional[Sequence[Dict[str, Any]]] = None,
+        schema_version: int = 1,
     ) -> Dict[str, Any]:
         label = self._validate_label(label)
         source_path = Path(image_path).resolve()
@@ -274,7 +298,11 @@ class ReviewedDatasetManager:
             raise FileNotFoundError(source_path)
         extension, media_type, image_width, image_height = _image_info(source_path)
         digest = _sha256(source_path)
-        normalized_regions = normalize_review_regions(label, regions)
+        normalized_regions = normalize_review_regions(
+            label,
+            regions,
+            schema_version=schema_version,
+        )
         display_name = normalize_display_filename(
             original_filename,
             fallback=f"task-{str(source.get('task_id') or digest[:8])}{extension}",
@@ -287,6 +315,7 @@ class ReviewedDatasetManager:
             note=note,
             reviewed_at=reviewed_at,
             regions=normalized_regions,
+            schema_version=schema_version,
         )
 
         with self._locked():
@@ -306,6 +335,11 @@ class ReviewedDatasetManager:
                     sources.append(source_record)
                 record["sources"] = sources
                 record["regions"] = _merge_source_regions(sources) if label == 1 else []
+                record["review_schema_version"] = max(
+                    int(record.get("review_schema_version") or 1),
+                    int(schema_version),
+                )
+                record["roi_truth_status"] = roi_truth_status(record)
                 record.setdefault("image_width", image_width)
                 record.setdefault("image_height", image_height)
                 record["updated_at"] = reviewed_at
@@ -334,6 +368,8 @@ class ReviewedDatasetManager:
                     "image_width": image_width,
                     "image_height": image_height,
                     "regions": normalized_regions,
+                    "review_schema_version": int(schema_version),
+                    "roi_truth_status": roi_truth_status({"regions": normalized_regions}),
                     "created_at": reviewed_at,
                     "updated_at": reviewed_at,
                     "reviewer": str(reviewer or "unknown"),
@@ -350,7 +386,11 @@ class ReviewedDatasetManager:
 
     def get_entry(self, sample_id: str) -> Optional[Dict[str, Any]]:
         found = self._find(sample_id)
-        return dict(found[1]) if found else None
+        if not found:
+            return None
+        record = dict(found[1])
+        record.setdefault("roi_truth_status", roi_truth_status(record))
+        return record
 
     def image_path(self, sample_id: str) -> Optional[Path]:
         found = self._find(sample_id)
@@ -371,7 +411,7 @@ class ReviewedDatasetManager:
         if label is not None:
             label = self._validate_label(label)
         rows = [
-            dict(record)
+            {**record, "roi_truth_status": record.get("roi_truth_status") or roi_truth_status(record)}
             for _path, record in self._iter_records()
             if label is None or int(record.get("label", -1)) == label
         ]
@@ -394,6 +434,7 @@ class ReviewedDatasetManager:
         reviewer: str,
         note: str = "",
         regions: Optional[Sequence[Dict[str, Any]]] = None,
+        schema_version: int = 1,
     ) -> Dict[str, Any]:
         label = self._validate_label(label)
         with self._locked():
@@ -404,10 +445,13 @@ class ReviewedDatasetManager:
             next_regions = normalize_review_regions(
                 label,
                 regions if regions is not None else record.get("regions"),
+                schema_version=schema_version,
             )
             if int(record.get("label", -1)) == label:
                 if record.get("regions") != next_regions:
                     record["regions"] = next_regions
+                    record["review_schema_version"] = int(schema_version)
+                    record["roi_truth_status"] = roi_truth_status(record)
                     record["updated_at"] = _now_iso()
                     self._write_metadata(metadata_path, record)
                 return record
@@ -429,6 +473,8 @@ class ReviewedDatasetManager:
                         "reviewer": str(reviewer or "unknown"),
                         "review_note": str(note or ""),
                         "regions": next_regions,
+                        "review_schema_version": int(schema_version),
+                        "roi_truth_status": roi_truth_status({"regions": next_regions}),
                     }
                 )
                 self._write_metadata(target_metadata, record)
@@ -446,6 +492,7 @@ class ReviewedDatasetManager:
         original_filename: Optional[str] = None,
         label: Optional[int] = None,
         regions: Optional[Sequence[Dict[str, Any]]] = None,
+        schema_version: int = 1,
         reviewer: str = "unknown",
         note: str = "",
     ) -> Dict[str, Any]:
@@ -456,6 +503,7 @@ class ReviewedDatasetManager:
                 reviewer=reviewer,
                 note=note,
                 regions=regions,
+                schema_version=schema_version,
             )
         with self._locked():
             found = self._find(sample_id)
@@ -466,7 +514,10 @@ class ReviewedDatasetManager:
                 record["regions"] = normalize_review_regions(
                     int(record.get("label", 0)),
                     regions,
+                    schema_version=schema_version,
                 )
+                record["review_schema_version"] = int(schema_version)
+                record["roi_truth_status"] = roi_truth_status(record)
                 record["updated_at"] = _now_iso()
             if original_filename is not None:
                 record["original_filename"] = normalize_display_filename(

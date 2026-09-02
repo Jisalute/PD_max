@@ -89,6 +89,9 @@ from app.services.tl_dict_geo_crud import (
     warehouse_update as sa_wh_update,
 )
 from app.services.vlm_extractor_service import QwenVLFullExtractor, VLMConfig
+from app.intelligent_prediction.services.daily_prediction_fingerprint import (
+    build_smm_price_fingerprint_from_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -10923,6 +10926,47 @@ class TLService:
                             "status": running[2],
                             "message": "正在预测，请勿重复提交",
                         }
+
+                    try:
+                        cur.execute(
+                            "SELECT id, celery_task_id, status, meta "
+                            "FROM pd_ip_prediction_batches "
+                            "WHERE prediction_type = %s AND status = 'completed' "
+                            "ORDER BY completed_at DESC, created_at DESC LIMIT 1",
+                            ("manual",),
+                        )
+                        latest_completed = cur.fetchone()
+                        if latest_completed:
+                            latest_meta = latest_completed[3] or {}
+                            if isinstance(latest_meta, str):
+                                try:
+                                    latest_meta = json.loads(latest_meta)
+                                except Exception:
+                                    latest_meta = {}
+                            cur.execute(
+                            "SELECT price_date, lead_price "
+                            "FROM pd_ip_lead_market_prices "
+                            "WHERE price_date >= DATE_SUB(CURDATE(), INTERVAL 60 DAY) "
+                            "ORDER BY price_date"
+                        )
+                        current_fingerprint = build_smm_price_fingerprint_from_rows(
+                            cur.fetchall()
+                        )
+                        if (
+                            isinstance(latest_meta, dict)
+                            and latest_meta.get("smm_price_fingerprint")
+                            == current_fingerprint
+                        ):
+                                return {
+                                "task_id": latest_completed[1],
+                                "batch_id": latest_completed[0],
+                                "status": "completed",
+                                "message": "今日已经预测过，报价未变化，无需重复预测",
+                                }
+                    except Exception:
+                        logger.exception(
+                            "daily prediction price fingerprint check failed; continue submitting"
+                        )
 
             batch_id = str(_uuid.uuid4())
             batch_status = "pending"

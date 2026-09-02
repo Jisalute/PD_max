@@ -1,0 +1,51 @@
+{
+  "task_id": "d1188d97-95f7-44c5-a7a8-37d3d409ffc5",
+  "judgment": "correct",
+  "timestamp": "20260720_162426",
+  "bbox": [
+    609,
+    460,
+    1152,
+    516
+  ],
+  "engine_result": {
+    "bbox": [
+      609,
+      460,
+      543,
+      56
+    ],
+    "reason": "存在局部边缘拼接/像素涂抹痕迹",
+    "result": "正常",
+    "region_no": 1,
+    "confidence": 0.4404241896048885,
+    "field_type": "name",
+    "field_label": "姓名",
+    "original_bbox": [
+      609,
+      460,
+      1152,
+      516
+    ],
+    "hard_tamper_flags": {
+      "bbox_iou": false
+    },
+    "bbox_overlap_check": {
+      "max_iou": 0.0,
+      "anomalies": [],
+      "box_count": 3,
+      "risk_max_iou": 0.0,
+      "overlapping_pairs": []
+    }
+  },
+  "user_note": "result_index:0",
+  "entry_id": "4c725619",
+  "original_image": "/home/ubuntu/var/www/PD_max/app/ai_detection/services/feedback/correct/20260720_162426_d1188d97-95f7-44c5-a7a8-37d3d409ffc5_4c725619/original.png",
+  "cropped_roi": null,
+  "original_filename": "24.png",
+  "content_sha256": "6b8d7aa49c371cb641f71637cb51d4c8f2b19380b22b06bb6978a6916952aeaf",
+  "size_bytes": 245043,
+  "media_type": "image/png",
+  "initial_reviewer": "anonymous",
+  "review_status": "pending"
+}

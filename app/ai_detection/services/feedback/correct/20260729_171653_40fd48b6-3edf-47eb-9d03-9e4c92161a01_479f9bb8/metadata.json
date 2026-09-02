@@ -1,0 +1,50 @@
+{
+  "task_id": "40fd48b6-3edf-47eb-9d03-9e4c92161a01",
+  "judgment": "correct",
+  "timestamp": "20260729_171653",
+  "bbox": [
+    581,
+    1803,
+    776,
+    1918
+  ],
+  "engine_result": {
+    "bbox": [
+      581,
+      1803,
+      195,
+      115
+    ],
+    "text": "豆包AI生成",
+    "reason": "识别到“豆包AI生成”水印轮廓，按业务规则直接判定篡改",
+    "result": "篡改",
+    "source": "doubao_ai_watermark_template",
+    "region_no": 1,
+    "confidence": 1.0,
+    "field_type": "other",
+    "field_label": "AI水印",
+    "evidence_type": "ai_generated_document",
+    "original_bbox": [
+      581,
+      1803,
+      776,
+      1918
+    ],
+    "ocr_confidence": null,
+    "watermark_score": 0.789388,
+    "detection_method": "watermark_template_fallback",
+    "hard_tamper_flags": {
+      "doubao_ai_watermark": true
+    }
+  },
+  "user_note": "result_index:0",
+  "entry_id": "479f9bb8",
+  "original_image": "/home/ubuntu/var/www/PD_max/app/ai_detection/services/feedback/correct/20260729_171653_40fd48b6-3edf-47eb-9d03-9e4c92161a01_479f9bb8/original.jpg",
+  "cropped_roi": null,
+  "original_filename": "崔卫荣_2076497559767355392_1.jpg",
+  "content_sha256": "106976eadf7e761bde340cf5593528ebc69073fe933f0f203bcaaf8ee51bd36c",
+  "size_bytes": 193748,
+  "media_type": "image/jpeg",
+  "initial_reviewer": "anonymous",
+  "review_status": "pending"
+}

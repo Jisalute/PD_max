@@ -10,7 +10,11 @@ import tempfile
 import pandas as pd
 
 from app.intelligent_prediction.logging_utils import get_logger
-from app.intelligent_prediction.db import get_prediction_session_factory
+from app.intelligent_prediction.db import (
+    dispose_prediction_engine,
+    get_prediction_session_factory,
+)
+from app.database import get_conn
 from app.intelligent_prediction.models import PredictionBatch
 from app.intelligent_prediction.schemas.doubao_prediction import DoubaoBatchRequest
 from app.intelligent_prediction.services.ai_client import get_ai_client
@@ -21,9 +25,29 @@ from app.intelligent_prediction.services.doubao_prediction_service import (
 )
 from app.intelligent_prediction.services.doubao_prompt_builder import DoubaoPromptBuilder
 from app.intelligent_prediction.services.audit_service import write_background_audit
+from app.intelligent_prediction.services.daily_prediction_fingerprint import (
+    build_smm_price_fingerprint,
+)
+from app.intelligent_prediction.services.daily_prediction_cache import build_smm_price_fingerprint
 from app.intelligent_prediction.tasks.celery_app import celery_app
 
 logger = get_logger(__name__)
+
+
+def _mark_batch_failed_sync(batch_id: str, error: Exception) -> None:
+    """Async DB 初始化失败时，用同步主库连接更新批次状态。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE pd_ip_prediction_batches "
+                    "SET status = 'failed', error_message = %s, completed_at = NOW() "
+                    "WHERE id = %s AND status IN ('pending', 'processing')",
+                    (str(error)[:2000], batch_id),
+                )
+            conn.commit()
+    except Exception:
+        logger.exception("failed to mark prediction batch as failed: %s", batch_id)
 
 
 async def _run_batch_async(batch_id: str) -> None:
@@ -164,6 +188,12 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 conn.close()
 
             if not target_warehouses:
+                batch.meta = {
+                    **(batch.meta or {}),
+                    "total_warehouses": 0,
+                    "completed_warehouses": 0,
+                    "progress_percent": 100,
+                }
                 batch.status = "completed"
                 batch.completed_at = datetime.now(timezone.utc)
                 await session.commit()
@@ -174,6 +204,15 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 "daily prediction: total target warehouses=%s, batch_id=%s",
                 len(target_warehouses), batch_id,
             )
+            total_warehouses = len(target_warehouses)
+            completed_warehouses = 0
+            batch.meta = {
+                **(batch.meta or {}),
+                "total_warehouses": total_warehouses,
+                "completed_warehouses": completed_warehouses,
+                "progress_percent": 0,
+            }
+            await session.commit()
 
             # 从 pd_ip_delivery_records 查询每个仓库的全部历史，按仓库级别预测
             wh_list = list(target_warehouses)
@@ -196,6 +235,11 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
             )
 
             smm_prices = await _load_smm_prices(session)
+            batch.meta = {
+                **(batch.meta or {}),
+                "smm_price_fingerprint": build_smm_price_fingerprint(smm_prices),
+            }
+            await session.commit()
 
             items: list[DoubaoPredictionRequest] = []
             # 构建 history_map：仓库名 → 历史记录列表，用于 persist 时推断 regional_manager/smelter
@@ -249,14 +293,31 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
             svc: DoubaoPredictionService = get_doubao_prediction_service(
                 get_ai_client(), get_cache_manager(), DoubaoPromptBuilder()
             )
-            from app.intelligent_prediction.services.predict_item_resolver import (
-                resolve_one_predict_item,
-            )
-
             results = []
             for req_item in items:
-                result, _hist = await resolve_one_predict_item(session, svc, req_item)
+                # 每日批量任务必须按本次批次重新预测，不能读取上一批结果或 Redis 缓存。
+                result = await svc.predict_single(
+                    session,
+                    req_item.model_copy(update={"use_cache": False}),
+                )
                 results.append(result)
+                # 逐仓库落库并提交进度，查询接口可以实时反映后台任务状态。
+                await svc.persist_sync_results(
+                    session,
+                    [result],
+                    batch_id=batch_id,
+                    history_map={req_item.warehouse: history_map.get(req_item.warehouse, [])},
+                )
+                completed_warehouses += 1
+                batch.meta = {
+                    **(batch.meta or {}),
+                    "total_warehouses": total_warehouses,
+                    "completed_warehouses": completed_warehouses,
+                    "progress_percent": round(
+                        completed_warehouses * 100 / total_warehouses, 2
+                    ),
+                }
+                await session.commit()
 
             # 覆盖机制：先删除同类型旧批次结果，再写入新结果，保证缓存数据每日覆盖
             old_batch_stmt = sa_select(PredictionBatch.id).where(
@@ -280,8 +341,6 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                     PredictionBatch.id.in_(old_batch_ids)
                 )
                 await session.execute(batch_del_stmt)
-
-            await svc.persist_sync_results(session, results, batch_id=batch_id, history_map=history_map)
 
             batch.status = "completed"
             batch.completed_at = datetime.now(timezone.utc)
@@ -320,11 +379,29 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
 
 @celery_app.task(name="intelligent_prediction.run_daily_ai_prediction")
 def run_daily_ai_prediction_task(batch_id: str) -> str:
-    asyncio.run(_run_daily_prediction_async(batch_id))
+    async def _run_with_cleanup() -> None:
+        try:
+            await _run_daily_prediction_async(batch_id)
+        except Exception as exc:
+            _mark_batch_failed_sync(batch_id, exc)
+            raise
+        finally:
+            await dispose_prediction_engine()
+
+    asyncio.run(_run_with_cleanup())
     return batch_id
 
 
 @celery_app.task(name="intelligent_prediction.run_prediction_batch")
 def run_prediction_batch_task(batch_id: str) -> str:
-    asyncio.run(_run_batch_async(batch_id))
+    async def _run_with_cleanup() -> None:
+        try:
+            await _run_batch_async(batch_id)
+        except Exception as exc:
+            _mark_batch_failed_sync(batch_id, exc)
+            raise
+        finally:
+            await dispose_prediction_engine()
+
+    asyncio.run(_run_with_cleanup())
     return batch_id

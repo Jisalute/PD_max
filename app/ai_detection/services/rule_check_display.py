@@ -16,6 +16,7 @@ def derive_rule_check_status(data: Optional[Dict[str, Any]]) -> str:
 
     pixel = data.get("pixel_overlap") or {}
     timestamp = data.get("timestamp") or {}
+    semantic = data.get("semantic") or {}
 
     if pixel.get("alert"):
         return "篡改"
@@ -25,6 +26,7 @@ def derive_rule_check_status(data: Optional[Dict[str, Any]]) -> str:
     risk_values = [
         float(timestamp.get("risk") or 0.0),
         float(pixel.get("pixel_overlap_score") or 0.0),
+        float(semantic.get("risk") or 0.0),
     ]
     if max(risk_values) >= 0.55:
         return "可疑"
@@ -49,6 +51,7 @@ def build_rule_check_public_summary(data: Optional[Dict[str, Any]]) -> Dict[str,
 
     pixel = data.get("pixel_overlap")
     timestamp = data.get("timestamp")
+    semantic = data.get("semantic")
     status = derive_rule_check_status(data)
 
     suggested = data.get("suggested_rois")
@@ -88,12 +91,21 @@ def build_rule_check_public_summary(data: Optional[Dict[str, Any]]) -> Dict[str,
         "transaction_time": ts_check.get("transaction_datetime") or ts_check.get("transaction_time"),
     } if timestamp is not None else None
 
+    semantic_item = {
+        "passed": not bool((semantic or {}).get("anomalies")),
+        "message": "；".join((semantic or {}).get("reasons") or []) or "金额、账号与明细排版未发现明显语义矛盾",
+        "anomalies": list((semantic or {}).get("anomalies") or []),
+    } if semantic is not None else None
+    ai_watermark = data.get("ai_watermark") or ((semantic or {}).get("semantic_check") or {}).get("ai_watermark")
+
     return {
         "status": status,
         "reason": data.get("reason") or "未检出明显规则类异常",
         "hard_tamper_flags": data.get("hard_tamper_flags") or {},
         "pixel_overlap": pixel_item,
         "timestamp": timestamp_item,
+        "semantic": semantic_item,
+        "ai_watermark": ai_watermark,
         "pixel_overlap_source": data.get("pixel_overlap_source"),
         "available": True,
     }

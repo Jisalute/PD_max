@@ -1,0 +1,50 @@
+{
+  "task_id": "7c8f3309-175c-4f05-babc-be6eeda14cfa",
+  "judgment": "correct",
+  "timestamp": "20260729_171649",
+  "bbox": [
+    1032,
+    1612,
+    1277,
+    1704
+  ],
+  "engine_result": {
+    "bbox": [
+      1032,
+      1612,
+      245,
+      92
+    ],
+    "text": "豆包AI生成",
+    "reason": "识别到“豆包AI生成”水印轮廓，按业务规则直接判定篡改",
+    "result": "篡改",
+    "source": "doubao_ai_watermark_template",
+    "region_no": 1,
+    "confidence": 1.0,
+    "field_type": "other",
+    "field_label": "AI水印",
+    "evidence_type": "ai_generated_document",
+    "original_bbox": [
+      1032,
+      1612,
+      1277,
+      1704
+    ],
+    "ocr_confidence": null,
+    "watermark_score": 0.919007,
+    "detection_method": "watermark_template_fallback",
+    "hard_tamper_flags": {
+      "doubao_ai_watermark": true
+    }
+  },
+  "user_note": "result_index:0",
+  "entry_id": "93e098c3",
+  "original_image": "/home/ubuntu/var/www/PD_max/app/ai_detection/services/feedback/correct/20260729_171649_7c8f3309-175c-4f05-babc-be6eeda14cfa_93e098c3/original.jpg",
+  "cropped_roi": null,
+  "original_filename": "段大恋_2076551041186689024_1.jpg",
+  "content_sha256": "f5b75a1e16a1b346ee3015f34e8e480bd49fba2f16c636616276ecf90e136241",
+  "size_bytes": 463050,
+  "media_type": "image/jpeg",
+  "initial_reviewer": "anonymous",
+  "review_status": "pending"
+}

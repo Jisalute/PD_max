@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.intelligent_prediction.settings import settings
 
@@ -30,13 +31,30 @@ def _ensure_engine() -> None:
             "未配置智能预测异步数据库 URL：请设置 PREDICTION_ASYNC_DATABASE_URL，"
             "或确保 MYSQL_HOST/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DATABASE 已填写以自动组装 mysql+aiomysql。"
         )
-    _engine = create_async_engine(url, echo=False, pool_pre_ping=True)
+    # Celery runs each asyncio.run() invocation on a new event loop. A pooled
+    # aiomysql connection can remain bound to the previous loop, so do not
+    # reuse connections across loop lifetimes.
+    _engine = create_async_engine(
+        url,
+        echo=False,
+        pool_pre_ping=True,
+        poolclass=NullPool,
+    )
     AsyncSessionLocal = async_sessionmaker(
         _engine,
         class_=AsyncSession,
         expire_on_commit=False,
         autoflush=False,
     )
+
+
+async def dispose_prediction_engine() -> None:
+    """释放当前事件循环中的异步引擎连接。"""
+    global _engine, AsyncSessionLocal
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    AsyncSessionLocal = None
 
 
 async def get_prediction_db_session() -> AsyncGenerator[AsyncSession, None]:
